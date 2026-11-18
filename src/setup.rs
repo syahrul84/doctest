@@ -240,7 +240,7 @@ mod tests {
         ] {
             assert!(b.contains(want), "{want} missing");
         }
-        assert!(!b.to_lowercase().contains("irems"));
+        assert!(!b.contains("/Users/") && !b.contains("~/Documents"), "no local paths in the shared rules");
     }
 
     fn opts(dir: &std::path::Path, scope: Scope) -> Opts {
