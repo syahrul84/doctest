@@ -272,6 +272,7 @@ fn build_cmd(project: &std::path::Path) -> Result<String, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let step = format!("cli:{}", std::env::args().nth(1).unwrap_or_default());
+    let started = std::time::Instant::now();
     let result: Result<(String, bool), String> = match cli.command {
         Command::Status {
             project,
@@ -339,6 +340,16 @@ fn main() -> ExitCode {
     match result {
         Ok((text, ok)) => {
             println!("{text}");
+            if !matches!(
+                std::env::args().nth(1).as_deref(),
+                Some("serve") | Some("--version") | Some("-V") | Some("help") | Some("--help")
+            ) {
+                eprintln!(
+                    "(doctest {} took {:.1}s)",
+                    step.trim_start_matches("cli:"),
+                    started.elapsed().as_secs_f64()
+                );
+            }
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Err(e) => {

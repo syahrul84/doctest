@@ -19,7 +19,7 @@ use crate::state::{CoverSource, RunRecord, State};
 use crate::testwrite::{self, NewTests};
 use crate::work::{self, Scope};
 
-pub const MCP_INSTRUCTIONS: &str = "doctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: each portal (admin, tenant, vendor…) has its own guide; facts gives the page's source_path inside its portal, and screenshots sign in as the portal's user. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
+pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: each portal (admin, tenant, vendor…) has its own guide; facts gives the page's source_path inside its portal, and screenshots sign in as the portal's user. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
 pub type Factory = std::sync::Arc<dyn Fn(&Config, usize) -> Box<dyn CodemapApi + Send> + Send + Sync>;
@@ -259,6 +259,7 @@ impl Server {
                 } else {
                     Box::new(crate::progress::Mcp::new(token, self.out.clone()))
                 };
+                let started = std::time::Instant::now();
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.call(&name, &args, &*progress)))
                         .unwrap_or_else(|_| Err(format!("the tool {name} panicked")));
@@ -270,6 +271,12 @@ impl Server {
                             self.told_update = true;
                             content.push(json!({"type": "text", "text": format!("(doctest {newer} is available; this server is {}. Tell the person: run `doctest update`.)", crate::update::VERSION)}));
                         }
+                        let all: String = content
+                            .iter()
+                            .filter_map(|c| c["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        content.push(json!({"type": "text", "text": summary(&name, Ok(&all), started.elapsed())}));
                         answer(json!({"content": content, "isError": false}))
                     }
                     Err(mut e) => {
@@ -291,7 +298,10 @@ impl Server {
                                 "\n(doctest recorded this as problem report {id}; tell the person they can file it with `doctest reports --send {id}`.)"
                             );
                         }
-                        answer(json!({"content": [{"type": "text", "text": e}], "isError": true}))
+                        let footer = summary(&name, Err(&e), started.elapsed());
+                        answer(
+                            json!({"content": [{"type": "text", "text": format!("{e}\n\n{footer}")}], "isError": true}),
+                        )
                     }
                 }
             }
@@ -536,6 +546,317 @@ fn report_kind(error: &str) -> &'static str {
     }
 }
 
+fn took(d: std::time::Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else {
+        work::duration(d.as_secs())
+    }
+}
+
+fn plural(n: usize, one: &str) -> String {
+    format!("{n} {one}{}", if n == 1 { "" } else { "s" })
+}
+
+/// Lines of `text` that start with "- " after `after` (or anywhere when empty).
+fn bullets(text: &str, after: &str) -> Vec<String> {
+    let start = if after.is_empty() {
+        0
+    } else {
+        text.find(after).map(|i| i + after.len()).unwrap_or(text.len())
+    };
+    text[start..]
+        .lines()
+        .filter_map(|l| l.strip_prefix("- "))
+        .map(|l| l.chars().take(160).collect())
+        .collect()
+}
+
+fn first_json(text: &str) -> Value {
+    let start = text.find(['{', '[']).unwrap_or(0);
+    let mut de = serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+    de.next().and_then(Result::ok).unwrap_or(Value::Null)
+}
+
+fn listed(items: &[String], max: usize) -> String {
+    let mut s = items.iter().take(max).cloned().collect::<Vec<_>>().join("; ");
+    if items.len() > max {
+        s += &format!("; … {} more", items.len() - max);
+    }
+    s
+}
+
+/// The summary every tool result ends with: how long it took, what it found, what to do next.
+pub fn summary(tool: &str, outcome: Result<&str, &str>, elapsed: std::time::Duration) -> String {
+    let (head, found, next) = match outcome {
+        Err(e) => {
+            let first = e.lines().next().unwrap_or(e).chars().take(200).collect::<String>();
+            let next = if e.contains("problem report") {
+                "tell the person the problem report id; then try again or move on to another item"
+            } else if e.contains("already covered") {
+                "drop those rows (existing tests cover them) and send the rest"
+            } else if e.contains("rolled back") {
+                "fix method_php (or the rows) as the message says and send write_test again"
+            } else if e.contains(" is required")
+                || e.contains("bad item")
+                || e.contains("not in [project]")
+                || e.contains("unknown")
+            {
+                "fix the request as the message says and call it again"
+            } else {
+                "read the message and fix it; if it is about setup (codemap, Chrome, login, settings), run doctor"
+            };
+            (
+                format!("{tool} failed after {}", took(elapsed)),
+                first,
+                next.to_string(),
+            )
+        }
+        Ok(text) => {
+            let (found, next): (String, String) = match tool {
+                "status" | "plan" => {
+                    let v = first_json(text);
+                    let items: Vec<String> = if tool == "status" {
+                        v["counts"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .map(|(k, n)| format!("{n} {k}"))
+                            .collect()
+                    } else {
+                        let mut m: BTreeMap<String, usize> = BTreeMap::new();
+                        for i in v.as_array().into_iter().flatten() {
+                            *m.entry(i["kind"].as_str().unwrap_or("item").to_string()).or_default() += 1;
+                        }
+                        m.into_iter().map(|(k, n)| format!("{n} {k}")).collect()
+                    };
+                    if items.is_empty() {
+                        (
+                            "nothing missing or out of date".into(),
+                            "run issues and check, then finish".into(),
+                        )
+                    } else {
+                        (
+                            format!("to do: {}", items.join(", ")),
+                            "work the items: claim (or facts on the first item), then write each one".into(),
+                        )
+                    }
+                }
+                "claim" => {
+                    let v = first_json(text);
+                    let n = v["items"].as_array().map(Vec::len).unwrap_or(0);
+                    if n == 0 {
+                        ("no items left".into(), "issues, check, build, then finish".into())
+                    } else {
+                        (
+                            format!("{} claimed, {} still queued", plural(n, "item"), v["queued"]),
+                            "facts for each item, then write it (write_doc / shoot / write_test)".into(),
+                        )
+                    }
+                }
+                "facts" => {
+                    let v = first_json(text);
+                    if let Some(cases) = v["cases"].as_array() {
+                        let missing = cases.iter().filter(|c| c["covered_by"].is_null()).count();
+                        (
+                            format!(
+                                "{} missing, {} already covered",
+                                plural(missing, "case"),
+                                cases.len() - missing
+                            ),
+                            if missing == 0 {
+                                "nothing to write for this target; next item".into()
+                            } else {
+                                "write_test: one method with a data provider, a row per missing case".into()
+                            },
+                        )
+                    } else if let Some(plan) = v["screenshot_plan"].as_array() {
+                        let actions = v["actions"].as_array().map(Vec::len).unwrap_or(0);
+                        (
+                            format!(
+                                "{}, {} planned",
+                                plural(actions, "action"),
+                                plural(plan.len(), "screenshot")
+                            ),
+                            "shoot each screenshot in screenshot_plan, then write_doc at source_path".into(),
+                        )
+                    } else {
+                        ("facts ready".into(), "write_doc from these facts".into())
+                    }
+                }
+                "cases" => {
+                    let v = first_json(text);
+                    let cases = v["cases"].as_array().cloned().unwrap_or_default();
+                    let missing = cases.iter().filter(|c| c["covered_by"].is_null()).count();
+                    (
+                        format!("{} missing, {} covered", plural(missing, "case"), cases.len() - missing),
+                        if missing == 0 {
+                            "next item".into()
+                        } else {
+                            "write_test with a row per missing case".into()
+                        },
+                    )
+                }
+                "write_doc" => {
+                    if text.starts_with("nothing was saved") {
+                        let errs = bullets(text, "");
+                        (
+                            format!("{}: {}", plural(errs.len(), "error"), listed(&errs, 3)),
+                            "fix those and send write_doc again".into(),
+                        )
+                    } else {
+                        let warns = bullets(text, "warnings:");
+                        (
+                            if warns.is_empty() {
+                                "nothing wrong".into()
+                            } else {
+                                format!("{}: {}", plural(warns.len(), "warning"), listed(&warns, 3))
+                            },
+                            "next item: claim (or facts on the next item); finish when none are left".into(),
+                        )
+                    }
+                }
+                "shoot" => (
+                    "nothing wrong".into(),
+                    "put the image in the guide with the path above, then continue".into(),
+                ),
+                "write_test" => {
+                    let failed: Vec<String> = text
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("- "))
+                        .filter(|l| l.contains("failed and was removed"))
+                        .map(|l| l.split(" failed").next().unwrap_or(l).to_string())
+                        .collect();
+                    let not_bugs = text.contains("marked as bugs but passing");
+                    if failed.is_empty() && !not_bugs {
+                        (
+                            "all rows pass".into(),
+                            "next item: claim; finish when none are left".into(),
+                        )
+                    } else {
+                        let mut f = Vec::new();
+                        if !failed.is_empty() {
+                            f.push(format!(
+                                "{} failed and removed: {}",
+                                plural(failed.len(), "row"),
+                                listed(&failed, 5)
+                            ));
+                        }
+                        if not_bugs {
+                            f.push("rows marked as bugs pass (not bugs)".into());
+                        }
+                        (
+                            f.join("; "),
+                            "read the code for each failed case: fix the row, or send it again with bug set if the code is wrong".into(),
+                        )
+                    }
+                }
+                "run_tests" => {
+                    let line = text.lines().next().unwrap_or_default().to_string();
+                    let failing = !line.contains(" 0 failed") && line.contains("failed");
+                    (
+                        line,
+                        if failing {
+                            "fix the failing tests listed (file:line)".into()
+                        } else {
+                            "continue".into()
+                        },
+                    )
+                }
+                "build" => ("nothing wrong".into(), "check".into()),
+                "check" => {
+                    let v = first_json(text);
+                    let n = |k: &str| v[k].as_array().map(Vec::len).unwrap_or(0);
+                    let first = v["errors"][0]
+                        .as_str()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(140)
+                        .collect::<String>();
+                    (
+                        format!(
+                            "{}, {}, {}, {}",
+                            plural(n("errors"), "error"),
+                            plural(n("warnings"), "warning"),
+                            plural(n("known_bugs"), "known bug"),
+                            plural(n("code_to_fix"), "code point")
+                        ),
+                        if n("errors") > 0 {
+                            format!("fix the errors (first: {first}), then check again")
+                        } else {
+                            "finish; tell the person about the code points".into()
+                        },
+                    )
+                }
+                "issues" => {
+                    let n = text
+                        .split_whitespace()
+                        .next()
+                        .and_then(|w| w.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    (
+                        if n == 0 {
+                            "no code problems".into()
+                        } else {
+                            format!("{} to fix", plural(n, "code point"))
+                        },
+                        if n == 0 {
+                            "continue".into()
+                        } else {
+                            "tell the person the points (file:line, reason, fix); fix them if they ask".into()
+                        },
+                    )
+                }
+                "verify_changes" => {
+                    let v = first_json(text);
+                    let fix = v["to_fix"].as_array().map(Vec::len).unwrap_or(0);
+                    let todo = v["still_to_do"].as_array().map(Vec::len).unwrap_or(0);
+                    (
+                        format!(
+                            "{}: {}, {} still to document or test",
+                            if v["pass"] == true { "pass" } else { "fail" },
+                            plural(fix, "point to fix"),
+                            plural(todo, "item")
+                        ),
+                        if fix > 0 {
+                            "fix the points (file:line), then verify_changes again".into()
+                        } else if todo > 0 {
+                            "work the remaining items (claim)".into()
+                        } else {
+                            "finish".into()
+                        },
+                    )
+                }
+                "finish" => (
+                    "run recorded".into(),
+                    "tell the person: how long it took, what was written, the code points and any problem reports"
+                        .into(),
+                ),
+                "doctor" => {
+                    let fails = text.lines().filter(|l| l.starts_with("FAIL")).count();
+                    let warns = text.lines().filter(|l| l.starts_with("warn")).count();
+                    (
+                        format!("{}, {}", plural(fails, "problem"), plural(warns, "warning")),
+                        if fails > 0 {
+                            "fix the FAIL lines first".into()
+                        } else {
+                            "continue".into()
+                        },
+                    )
+                }
+                "report_problem" => (
+                    "problem recorded".into(),
+                    "tell the person the id and `doctest reports --send <id>`".into(),
+                ),
+                _ => ("done".into(), "continue".into()),
+            };
+            (format!("{tool} took {}", took(elapsed)), found, next)
+        }
+    };
+    format!("— doctest: {head}\nfound: {found}\nnext: {next}")
+}
+
 pub fn prompts() -> Value {
     json!([
         {"name": "all", "description": "Document and test the whole application: every guide, screenshot, translation, system section and test case that is missing or out of date. Options: a number of workers (default 1), `redo` to rewrite every guide.",
@@ -594,7 +915,7 @@ pub fn prompt_text(name: &str, words: &[String]) -> Option<String> {
         )
     };
     Some(format!(
-        "Document and test {what} with doctest (scope \"{scope_word}\"{redo_note}). Keep going without asking me unless you are blocked.
+        "Document and test {what} with doctest (scope \"{scope_word}\"{redo_note}). Keep going without asking me unless you are blocked. Every doctest reply ends with a summary (took / found / next): follow its next line, and keep the times and findings for your report.
 
 1. Call the doctor tool. If there is no .doctest.toml, run `doctest init` in the Laravel repo, then fill its TODO lines from the project itself (codemap: the login page and its fields, locale files, menu file, portals from route-name prefixes, the test command and container, the app's local URL). Ask me only for the test login (DOCTEST_USER / DOCTEST_PASSWORD) when screenshots need it and it is not set.
 2. Call status with {{{args}}} and tell me the counts and the progress percentages.
@@ -2051,6 +2372,51 @@ mod tests {
         let st = State::load(&cfg);
         assert_eq!(st.runs.last().unwrap().seconds, Some(125));
         assert!(st.run_started.is_none());
+    }
+
+    fn last_text(s: &mut Server, tool: &str, args: Value) -> (String, bool) {
+        let reply = s.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}})).unwrap();
+        let parts = reply["result"]["content"].as_array().unwrap();
+        (
+            parts.last().unwrap()["text"].as_str().unwrap_or_default().to_string(),
+            reply["result"]["isError"].as_bool().unwrap_or(false),
+        )
+    }
+
+    #[test]
+    fn every_step_ends_with_a_summary() {
+        let (_d, cfg) = project();
+        let mut s = server();
+        let (sum, _) = last_text(&mut s, "status", json!({"project": cfg.root, "scope": "all"}));
+        assert!(
+            sum.contains("— doctest: status took") && sum.contains("found:") && sum.contains("next:"),
+            "{sum}"
+        );
+        assert!(sum.contains("guide"), "{sum}");
+        let bad = "---\ntitle: New Order\nkind: page\nroutes: [shop.orders.create]\n---\nClick **Submit**.\n";
+        let (sum, _) = last_text(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "markdown": bad}),
+        );
+        assert!(
+            sum.contains("found: 1 error") && sum.contains("Submit") && sum.contains("next: fix"),
+            "{sum}"
+        );
+        let good = "---\ntitle: New Order\nkind: page\nroutes: [shop.orders.create]\n---\nClick **Save**.\n";
+        let (sum, _) = last_text(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "markdown": good}),
+        );
+        assert!(
+            sum.contains("found: nothing wrong") && sum.contains("next:") && sum.contains("claim"),
+            "{sum}"
+        );
+        let (sum, err) = last_text(&mut s, "facts", json!({"project": cfg.root, "item": "guide:xx:nope"}));
+        assert!(err && sum.contains("facts failed") && sum.contains("next:"), "{sum}");
+        let (sum, _) = last_text(&mut s, "check", json!({"project": cfg.root}));
+        assert!(sum.contains("found:") && sum.contains("error"), "{sum}");
     }
 
     #[test]
