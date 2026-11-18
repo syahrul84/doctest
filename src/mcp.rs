@@ -1068,6 +1068,107 @@ fn run_plan(
     Ok(plan)
 }
 
+/// Facts for a module section: its pages (with their guides), the endpoints its pages call (with controller,
+/// permissions and middleware), the controllers, the tables of the models they use, the jobs they dispatch and the
+/// menu permissions.
+fn module_facts(
+    fb: &mut FactBuilder,
+    cfg: &Config,
+    labels: &Labels,
+    sources: &[Source],
+    primary: &str,
+    m: &str,
+) -> Result<Value, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    static MODEL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^use\s+App\\Models\\([\w\\]+)\s*;").unwrap());
+    static JOB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:dispatch(?:Now|Sync)?\(\s*new\s+|new\s+)(\w+Job)\b|\b(\w+)::dispatch(?:Now|Sync|AfterResponse)?\(",
+        )
+        .unwrap()
+    });
+    let pages: Vec<crate::pages::Page> = fb
+        .pages()?
+        .into_iter()
+        .filter(|x| source::slug(&x.module) == m)
+        .collect();
+    let mut cache = crate::factcache::FactCache::load(cfg, labels.files_hash());
+    let mut list = Vec::new();
+    let mut endpoints: BTreeMap<String, Value> = BTreeMap::new();
+    let mut controller_files: BTreeSet<String> = BTreeSet::new();
+    let mut permissions: BTreeSet<String> = BTreeSet::new();
+    for page in &pages {
+        let f = match cache.get(cfg, &page.key).filter(|f| f.page == *page) {
+            Some(f) => f,
+            None => {
+                let f = fb.facts(page)?;
+                cache.put(cfg, &f);
+                f
+            }
+        };
+        let g = work::page_guide(sources, &page.key, primary);
+        list.push(json!({"page": page.key, "path": page.path, "portal": page.portal, "guide": g.map(|g| g.path.clone()), "summary": g.map(|g| g.fm.summary.clone())}));
+        for e in &f.endpoints {
+            let id = format!("{} {}", e.method, e.uri);
+            let entry = endpoints.entry(id).or_insert_with(|| {
+                json!({"action": e.action, "at": e.at, "permissions": e.permissions, "middleware": e.middleware, "fields": e.rules.keys().collect::<Vec<_>>(), "pages": [], "possible": true})
+            });
+            if let Some(a) = entry["pages"].as_array_mut() {
+                a.push(json!(page.key));
+            }
+            if !e.possible {
+                entry["possible"] = json!(false);
+            }
+            permissions.extend(e.permissions.iter().cloned());
+            if let Some((file, _)) = e.at.as_deref().and_then(|a| a.rsplit_once(':')) {
+                controller_files.insert(file.to_string());
+            }
+        }
+    }
+    cache.save();
+    for entry in fb
+        .menu
+        .iter()
+        .filter(|x| source::slug(&x.module) == m && !x.aro.is_empty())
+    {
+        permissions.insert(entry.aro.clone());
+    }
+    let mut models: BTreeSet<String> = BTreeSet::new();
+    let mut jobs: BTreeSet<String> = BTreeSet::new();
+    for file in &controller_files {
+        let src = std::fs::read_to_string(cfg.backend.join(file)).unwrap_or_default();
+        models.extend(MODEL.captures_iter(&src).map(|c| c[1].to_string()));
+        for c in JOB.captures_iter(&src) {
+            if let Some(j) = c.get(1).or(c.get(2)) {
+                let j = j.as_str();
+                if j.ends_with("Job") || !["Bus", "Event", "Queue", "self", "static", "parent"].contains(&j) {
+                    jobs.insert(j.to_string());
+                }
+            }
+        }
+    }
+    let mut tables: Vec<Value> = Vec::new();
+    for model in models.iter().take(40) {
+        let sym = fb
+            .api()
+            .call(BACKEND, "get_symbol", json!({"name": format!("App\\Models\\{model}")}))?;
+        if let Some(table) = sym.data["model"]["table"].as_str() {
+            tables.push(json!({"model": model, "table": table, "relations": sym.data["model"]["relations"]}));
+        }
+    }
+    let n = endpoints.len();
+    Ok(json!({
+        "pages": list,
+        "endpoints": endpoints,
+        "controllers": controller_files,
+        "tables": tables,
+        "jobs": jobs,
+        "permissions": permissions,
+        "note": format!("{} page(s), {n} endpoint(s); possible: true marks one reached only through shared code (it may belong to another module). Describe what the module does, its screens, its API (method, URI, permission), the tables it keeps its data in and the jobs it runs; get_schema in codemap gives the columns of a table.", pages.len()),
+    }))
+}
+
 /// `kind:lang:rest` → (kind, lang, rest); `doc:x` → ("doc", "", x); `shot:id`, `tests:target`.
 fn split_item(item: &str) -> Result<(&str, &str, &str), String> {
     let (kind, rest) = item.split_once(':').ok_or_else(|| format!("bad item {item}"))?;
@@ -1261,12 +1362,7 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                     .paged(BACKEND, "list_routes", json!({"permissions": true}), "routes")?;
                 json!({"routes": routes.len(), "first_300": routes.into_iter().take(300).collect::<Vec<_>>()})
             } else if let Some(m) = key.strip_prefix("system/modules/") {
-                let pages = fb.pages()?;
-                let list: Vec<Value> = pages.iter().filter(|x| source::slug(&x.module) == m).map(|x| {
-                    let g = work::page_guide(&sources, &x.key, &primary);
-                    json!({"page": x.key, "path": x.path, "guide": g.map(|g| g.path.clone()), "summary": g.map(|g| g.fm.summary.clone())})
-                }).collect();
-                json!({"pages": list})
+                module_facts(&mut fb, &cfg, &labels, &sources, &primary, m)?
             } else {
                 Value::Null
             };
@@ -1277,6 +1373,12 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                     "nginx": format!("location ^~ {p}/ {{ alias <app path on the server>/document/guide/; index index.html; }}", p = cfg.guide.publish_path.trim_end_matches('/')),
                     "note": "Publish only document/guide. index.html and system/ hold server setup and env key names: keep them internal.",
                 })
+            } else {
+                Value::Null
+            };
+            // the server block (versions, extensions, env keys, services) only where it is written about
+            let server = if ["index", "system/configuration", "system/architecture"].contains(&key) {
+                serde_json::to_value(&server).unwrap_or(Value::Null)
             } else {
                 Value::Null
             };
@@ -2219,6 +2321,34 @@ mod tests {
             text.contains("/docs") && text.contains("document/guide") && text.contains("location"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn module_facts_list_endpoints_and_tables_without_the_server_block() {
+        let (_d, cfg) = project();
+        let ctl = cfg.backend.join("app/Http/Controllers/OrderController.php");
+        let src = std::fs::read_to_string(&ctl).unwrap().replacen(
+            "use Illuminate\\Http\\Request;",
+            "use Illuminate\\Http\\Request;\nuse App\\Models\\Order;",
+            1,
+        );
+        assert!(src.contains("App\\Models\\Order"), "{src}");
+        std::fs::write(&ctl, src).unwrap();
+        let mut s = server();
+        let (text, err) = call(
+            &mut s,
+            "facts",
+            json!({"project": cfg.root, "item": "doc:system/modules/orders"}),
+        );
+        assert!(!err, "{text}");
+        let v: Value = serde_json::from_str(text.split("\n— doctest").next().unwrap()).unwrap();
+        assert!(v["server"].is_null(), "server block repeated: {text}");
+        let d = &v["details"];
+        assert!(d["endpoints"].as_object().is_some_and(|e| !e.is_empty()), "{d}");
+        assert!(d["controllers"].to_string().contains("OrderController"), "{d}");
+        assert!(d["tables"].to_string().contains("\"orders\""), "{d}");
+        let (index, _) = call(&mut s, "facts", json!({"project": cfg.root, "item": "doc:index"}));
+        assert!(index.contains("\"server\": {"), "index keeps the server block");
     }
 
     #[test]

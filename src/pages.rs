@@ -100,6 +100,19 @@ pub struct FactBuilder<'a> {
 }
 
 impl<'a> FactBuilder<'a> {
+    /// A message given as an i18n key (`recordSuccessfullyUploaded`, `messages.saved`) → its text in the primary
+    /// language, when a locale file has it.
+    fn message_text(&self, m: &str) -> String {
+        let is_key = !m.contains(' ') && m.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !is_key {
+            return m.to_string();
+        }
+        self.labels
+            .resolve(self.cfg.primary_language(), m)
+            .map(String::from)
+            .unwrap_or_else(|| m.to_string())
+    }
+
     pub fn new(api: &'a mut dyn CodemapApi, cfg: &'a Config, labels: &'a Labels) -> FactBuilder<'a> {
         let menu = cfg
             .guide
@@ -321,6 +334,7 @@ impl<'a> FactBuilder<'a> {
             code_files.insert(file.clone());
             let text = std::fs::read_to_string(dir.join(&file)).unwrap_or_default();
             literals.extend(template_literals(&text));
+            literals.extend(script_literals(&text));
             let pages_using = self
                 .page_components
                 .get(&(page.app.clone(), PathBuf::from(&file)))
@@ -658,7 +672,10 @@ impl<'a> FactBuilder<'a> {
             if let Some(src) = self.source_of(&sym) {
                 e.at = Some(format!("{}:{}", sym["file"].as_str().unwrap_or_default(), sym["line"]));
                 e.rules = parse_rules(&src);
-                e.messages = parse_messages(&src);
+                e.messages = parse_messages(&src)
+                    .into_iter()
+                    .map(|m| self.message_text(&m))
+                    .collect();
             }
             let requests: Vec<String> = sym["meta"]["params"]
                 .as_array()
@@ -1181,6 +1198,25 @@ static ATTR: LazyLock<Regex> = LazyLock::new(|| {
 });
 static TEXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">([^<>{}]*[A-Za-z][^<>{}]*)<").unwrap());
 
+static SCRIPT_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b(?:label|title|text|header|headerName|placeholder|caption|tooltip|buttonText|confirmText|confirmButtonText|cancelButtonText|emptyText)\s*:\s*(?:'([^'\n]*)'|"([^"\n]*)")"#).unwrap()
+});
+
+/// Screen text set in a component's script: column headers, button and dialog texts (`label: 'Name'`,
+/// `title: "Delete booking?"`). i18n keys and paths are left out.
+pub fn script_literals(vue: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in SCRIPT_TEXT.captures_iter(vue) {
+        let s = c.get(1).or(c.get(2)).map(|m| m.as_str().trim()).unwrap_or_default();
+        let looks_like_key = !s.contains(' ') && (s.contains('.') || s.contains('/') || s.contains('_'));
+        let lower_word = !s.contains(' ') && s.chars().next().is_some_and(|ch| ch.is_lowercase());
+        if s.chars().any(char::is_alphabetic) && !looks_like_key && !lower_word && !out.iter().any(|o| o == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
 /// Text written straight into a .vue template: attribute values (label="…") and text between tags.
 pub fn template_literals(vue: &str) -> Vec<String> {
     let start = vue.find("<template").unwrap_or(0);
@@ -1411,8 +1447,10 @@ fn walk_menu(node: &Node, module: &str, group: &str, out: &mut Vec<MenuEntry>) {
 }
 
 /// sha256 of the facts in a canonical order, plus the hash of the locale files.
-/// Prefix of the current fingerprint format; fingerprints without it were made by an older doctest.
-pub const FINGERPRINT_VERSION: &str = "v2:";
+/// Prefix of the current fingerprint format; fingerprints without it were made by an older doctest. Bump it whenever
+/// doctest reads pages differently (new kinds of screen text, better endpoint attribution), so guides that were up
+/// to date carry over instead of all turning stale.
+pub const FINGERPRINT_VERSION: &str = "v3:";
 
 /// What a page's guide depends on: what the user sees (path, labels, literal texts, menu path) and what its actions
 /// do (endpoints with their rules, permissions and messages). doctest's own bookkeeping (code files, components,
@@ -1775,6 +1813,18 @@ pub(crate) mod tests {
         assert_eq!(empty.len(), 3, "{empty:?}");
         assert!(empty[1].starts_with("Add:"), "{empty:?}");
         assert!(says_no_data("x\n<!-- no-data: no bookings yet -->\n"));
+    }
+
+    #[test]
+    fn script_texts_count_as_screen_text() {
+        let vue = r#"<script>
+const columns = [{ label: 'Name', field: 'name' }, { label: "Code" }, { title: 'Delete booking?' }];
+const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 'Search by name' };
+</script>"#;
+        assert_eq!(
+            script_literals(vue),
+            vec!["Name", "Code", "Delete booking?", "Search by name"]
+        );
     }
 
     #[test]

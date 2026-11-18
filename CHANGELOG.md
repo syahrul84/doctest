@@ -20,6 +20,12 @@ Fixes from the first long run on a real project:
   is handed out; page facts cached between runs, so a repeat `status` reads only changed pages.
 - A page's fingerprint covers only what its guide depends on, so upgrading doctest no longer marks every guide stale
   (guides checked with the old format carry over).
+- Content checks: bold labels may hold ">" (a menu path is split only at " > "); form fields count by their name
+  (Name, Code); column headers and dialog texts set in scripts count as screen text; messages given as i18n keys are
+  shown as their text; only sentence-like success messages are expected in the guide.
+- System document: module facts list the endpoints the module's pages call (controller, permissions, fields), the
+  controllers, the tables of their models, the jobs they dispatch and the menu permissions; the server block is only
+  in the start page, configuration and architecture facts.
 
 - MCP server and CLI for Laravel + Vue 2/3 projects, built on codemap.
 - User guide per page and per language, one guide per portal, checked against the real screen (labels, buttons,

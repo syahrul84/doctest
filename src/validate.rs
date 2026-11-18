@@ -82,10 +82,24 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             .chain(&cfg.guide.allow_bold)
             .map(|s| norm(s))
             .chain(TEMPLATE_BOLD.iter().map(|s| norm(s)))
+            // form fields are labelled after their name (`code` → Code, `area_size` → Area size)
+            .chain(
+                f.endpoints
+                    .iter()
+                    .flat_map(|e| e.rules.keys())
+                    .map(|k| norm(&crate::pages::headline(k.split('.').next_back().unwrap_or(k)))),
+            )
             .collect();
         let mut reported = Vec::new();
         for cap in BOLD.captures_iter(&text) {
-            for part in cap[1].split('>') {
+            // a menu path is written **A > B**; a label may itself hold ">" or "->"
+            let whole = norm(&cap[1]);
+            let parts: Vec<&str> = if known.contains(&whole) || !cap[1].contains(" > ") && !cap[1].contains(" › ") {
+                vec![&cap[1]]
+            } else {
+                cap[1].split(" > ").flat_map(|p| p.split(" › ")).collect()
+            };
+            for part in parts {
                 let n = norm(part);
                 if n.is_empty() || known.contains(&n) || reported.contains(&n) {
                     continue;
@@ -127,7 +141,8 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                         a.name, a.endpoint, a.name
                     )));
                 }
-                for m in &a.success {
+                // only messages that read as sentences (an untranslated key cannot be quoted)
+                for m in a.success.iter().filter(|m| m.trim().contains(' ')) {
                     if !src.body.contains(m.as_str()) {
                         out.push(Problem::warning(format!(
                             "the {} action's success message *{m}* is not in the guide",
@@ -302,6 +317,29 @@ mod tests {
             )),
             vec![]
         );
+    }
+
+    #[test]
+    fn labels_with_arrows_and_field_names() {
+        let src = page(
+            "en",
+            "Set **Header rows -> 2**, then fill **Code** and **Area size**. Open **Orders > New Order**.",
+        );
+        let d = tempfile::tempdir().unwrap();
+        let cfg = shop_config(d.path());
+        let mut f = facts();
+        f.literals.push("Header rows -> 2".into());
+        f.endpoints.push(crate::pages::Endpoint {
+            method: "POST".into(),
+            uri: "api/locations".into(),
+            rules: BTreeMap::from([
+                ("code".to_string(), vec!["required".to_string()]),
+                ("details.area_size".to_string(), vec![]),
+            ]),
+            ..Default::default()
+        });
+        let p = check_source(&src, Some(&f), &cfg, std::slice::from_ref(&src));
+        assert!(p.iter().all(|x| !x.message.contains("unknown UI name")), "{p:?}");
     }
 
     #[test]

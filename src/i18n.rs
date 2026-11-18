@@ -103,6 +103,16 @@ impl Labels {
         }
     }
 
+    /// A key's text, also when the key is given without its namespace (`saved` for `messages.saved`).
+    pub fn resolve(&self, lang: &str, key: &str) -> Option<&str> {
+        if let Some(v) = self.text(lang, key) {
+            return Some(v);
+        }
+        let map = self.by_lang.get(lang)?;
+        let suffix = format!(".{key}");
+        map.iter().find(|(k, _)| k.ends_with(&suffix)).map(|(_, v)| v.as_str())
+    }
+
     /// Changes whenever any locale file read changes.
     pub fn files_hash(&self) -> &str {
         &self.hash
@@ -469,5 +479,23 @@ mod tests {
             .to_string();
         assert_ne!(a, b);
         assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn resolves_keys_without_namespace() {
+        let mut l = Labels::default();
+        l.by_lang.insert(
+            "en".into(),
+            BTreeMap::from([(
+                "messages.recordSuccessfullyUploaded".to_string(),
+                "Record uploaded.".to_string(),
+            )]),
+        );
+        assert_eq!(l.resolve("en", "recordSuccessfullyUploaded"), Some("Record uploaded."));
+        assert_eq!(
+            l.resolve("en", "messages.recordSuccessfullyUploaded"),
+            Some("Record uploaded.")
+        );
+        assert_eq!(l.resolve("en", "nothing"), None);
     }
 }
