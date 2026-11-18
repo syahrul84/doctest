@@ -260,7 +260,10 @@ impl<'a> FactBuilder<'a> {
         }
         self.page_components.clear();
         for p in &all {
-            *self.page_components.entry((p.app.clone(), p.component.clone())).or_default() += 1;
+            *self
+                .page_components
+                .entry((p.app.clone(), p.component.clone()))
+                .or_default() += 1;
         }
         if self.portals.is_empty() {
             let screens: Vec<crate::portals::Screen> = all
@@ -318,7 +321,11 @@ impl<'a> FactBuilder<'a> {
             code_files.insert(file.clone());
             let text = std::fs::read_to_string(dir.join(&file)).unwrap_or_default();
             literals.extend(template_literals(&text));
-            let pages_using = self.page_components.get(&(page.app.clone(), PathBuf::from(&file))).copied().unwrap_or(0);
+            let pages_using = self
+                .page_components
+                .get(&(page.app.clone(), PathBuf::from(&file)))
+                .copied()
+                .unwrap_or(0);
             let name = Path::new(&file)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -440,9 +447,7 @@ impl<'a> FactBuilder<'a> {
                         e.possible = possible;
                         endpoints.push(e);
                     }
-                } else if !possible
-                    && let Some(e) = endpoints.iter_mut().find(|e| e.method == method && e.uri == uri)
-                {
+                } else if !possible && let Some(e) = endpoints.iter_mut().find(|e| e.method == method && e.uri == uri) {
                     e.possible = false;
                 }
             }
@@ -810,7 +815,10 @@ fn reads_as_success(m: &str) -> bool {
 
 /// A layout: a component that renders the routed page inside it.
 pub fn is_layout(vue: &str) -> bool {
-    vue.contains("<router-view") || vue.contains("<RouterView") || vue.contains("<nuxt-page") || vue.contains("<NuxtPage")
+    vue.contains("<router-view")
+        || vue.contains("<RouterView")
+        || vue.contains("<nuxt-page")
+        || vue.contains("<NuxtPage")
 }
 
 /// A screen many routes share (route props such as `{kind}` pick what it shows), or a component used all over.
@@ -860,7 +868,12 @@ fn action_of(e: &Endpoint, name: String) -> Action {
         name,
         endpoint: format!("{} {}", e.method, e.uri),
         fields: e.rules.keys().cloned().collect(),
-        required: e.rules.iter().filter(|(_, r)| r.iter().any(|x| x == "required")).map(|(k, _)| k.clone()).collect(),
+        required: e
+            .rules
+            .iter()
+            .filter(|(_, r)| r.iter().any(|x| x == "required"))
+            .map(|(k, _)| k.clone())
+            .collect(),
         success,
         errors,
     }
@@ -898,15 +911,55 @@ pub fn actions(f: &PageFacts) -> Vec<Action> {
     out
 }
 
-/// The screenshots a page guide should have.
+/// Does the action work on an existing record (so it cannot be shown on a page with no data)?
+fn needs_a_record(a: &Action) -> bool {
+    !matches!(
+        a.name.as_str(),
+        "Add" | "Import" | "Upload" | "Export" | "Generate" | "Download" | "Print"
+    )
+}
+
+/// The screenshots a page guide must have: the page, one form shot that covers Add and Edit, and one per other
+/// action. With `no_data` (the page has no records to show), only the page and what works without a record.
+pub fn screenshot_plan_for(actions: &[Action], no_data: bool) -> Vec<String> {
+    let mut out = vec!["the page as it opens (list or form, with demo data if there is any)".to_string()];
+    let form: Vec<&str> = actions
+        .iter()
+        .filter(|a| a.name == "Add" || a.name == "Edit")
+        .filter(|a| !no_data || !needs_a_record(a))
+        .map(|a| a.name.as_str())
+        .collect();
+    if !form.is_empty() {
+        out.push(format!(
+            "{}: the form (one shot covers {}; filled in, before saving)",
+            form.join("/"),
+            if form.len() > 1 { "both" } else { "it" }
+        ));
+    }
+    for a in actions {
+        if a.name == "Add" || a.name == "Edit" || (no_data && needs_a_record(a)) {
+            continue;
+        }
+        out.push(match a.name.as_str() {
+            "Delete" => "Delete: the confirm dialog".to_string(),
+            other => format!("{other}: the button or dialog"),
+        });
+    }
+    out
+}
+
+/// The screenshots a page guide must have (see [`screenshot_plan_for`]).
 pub fn screenshot_plan(actions: &[Action]) -> Vec<String> {
-    let mut out = vec!["the page as it opens (list or form, with demo data)".to_string()];
+    screenshot_plan_for(actions, false)
+}
+
+/// Screenshots worth adding when they make a step clearer; never required.
+pub fn optional_shots(actions: &[Action]) -> Vec<String> {
+    let mut out = Vec::new();
     for a in actions {
         match a.name.as_str() {
             "Add" => {
-                out.push("Add: the empty form".into());
-                out.push("Add: the form filled in, before saving".into());
-                out.push("Add: the result after saving (the message and the new row)".into());
+                out.push("Add: the result after saving (the message and the new row)".to_string());
                 if !a.required.is_empty() {
                     out.push(format!(
                         "Add: a validation error (save with {} empty)",
@@ -914,21 +967,16 @@ pub fn screenshot_plan(actions: &[Action]) -> Vec<String> {
                     ));
                 }
             }
-            "Edit" => {
-                out.push("Edit: the form with a record loaded".into());
-                out.push("Edit: the result after saving".into());
-            }
-            "Delete" => {
-                out.push("Delete: the confirm dialog".into());
-                out.push("Delete: the list after deleting".into());
-            }
-            other => {
-                out.push(format!("{other}: before (the button or dialog)"));
-                out.push(format!("{other}: the result"));
-            }
+            "Delete" => out.push("Delete: the list after deleting".into()),
+            other => out.push(format!("{other}: the result")),
         }
     }
     out
+}
+
+/// A guide that says its page has no data to show (`<!-- no-data -->`, optionally with a reason).
+pub fn says_no_data(body: &str) -> bool {
+    body.contains("<!-- no-data")
 }
 
 /// `member.name` / `banner_type` → `Member name` / `Banner type` (how Filament and most UIs label a field).
@@ -1683,35 +1731,56 @@ pub(crate) mod tests {
         assert_eq!(a[2].success, vec!["Order deleted."]);
         assert_eq!(a[2].errors, vec!["Order is in use."]);
         let plan = screenshot_plan(&a);
-        assert!(plan.len() > a.len());
+        // the page, one form for Add and Edit, Delete, Approve, Export
+        assert_eq!(plan.len(), 5, "{plan:?}");
+        assert!(plan[1].contains("Add/Edit") && plan[1].contains("both"), "{plan:?}");
         assert!(
             plan.iter().any(|s| s.contains("Delete") && s.contains("confirm")),
             "{plan:?}"
         );
-        assert!(plan.iter().any(|s| s.contains("validation error")), "{plan:?}");
+        assert!(optional_shots(&a).iter().any(|s| s.contains("validation error")));
+        // no data: the page, the Add form and Export (needs no record)
+        let empty = screenshot_plan_for(&a, true);
+        assert_eq!(empty.len(), 3, "{empty:?}");
+        assert!(empty[1].starts_with("Add:"), "{empty:?}");
+        assert!(says_no_data("x\n<!-- no-data: no bookings yet -->\n"));
     }
 
     #[test]
     fn possible_actions_need_a_button_on_the_page() {
         let mut f = sample();
-        let mut del = ep("DELETE", "api/assets/depreciation/{id}", &["Record successfully deleted."], &[]);
+        let mut del = ep(
+            "DELETE",
+            "api/assets/depreciation/{id}",
+            &["Record successfully deleted."],
+            &[],
+        );
         del.possible = true;
         let mut approve = ep("POST", "api/bookings/{id}/approve", &[], &[]);
         approve.possible = true;
         f.endpoints = vec![ep("POST", "api/categories", &[], &[]), del, approve];
         f.literals = vec!["New".into(), "Approve".into()];
         let names: Vec<String> = actions(&f).into_iter().map(|a| a.name).collect();
-        assert_eq!(names, vec!["Add", "Approve"], "a shared module's Delete without a Delete button is not this page's action");
+        assert_eq!(
+            names,
+            vec!["Add", "Approve"],
+            "a shared module's Delete without a Delete button is not this page's action"
+        );
         let maybe: Vec<String> = possible_actions(&f).into_iter().map(|a| a.name).collect();
         assert_eq!(maybe, vec!["Delete"]);
     }
 
     #[test]
     fn layouts_and_shared_screens() {
-        assert!(is_layout("<template><v-app><Header/><router-view /></v-app></template>"));
+        assert!(is_layout(
+            "<template><v-app><Header/><router-view /></v-app></template>"
+        ));
         assert!(is_layout("<template><RouterView></RouterView></template>"));
         assert!(!is_layout("<template><div>Orders</div></template>"));
-        assert!(is_shared(2, 0), "a component behind two routes (route props such as {{kind}}) is a shared screen");
+        assert!(
+            is_shared(2, 0),
+            "a component behind two routes (route props such as {{kind}}) is a shared screen"
+        );
         assert!(is_shared(1, 3));
         assert!(!is_shared(1, 1));
     }

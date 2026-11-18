@@ -82,7 +82,7 @@ allow_bold = ["Note"]                 # bold words allowed that are not on any s
 include = ["admin.*"]                 # only these pages (route name or path; * at the end); empty = all
 exclude = []
 require_actions = true                # a section per action (Add, Edit, Delete, Approve…) with what you should see
-# min_screenshots = 4                 # default: 1 + one per action
+# min_screenshots = 4                 # default: the page, one form shot for Add and Edit, one per other action
 
 publish_path = "/docs"                # where the server publishes document/guide
 

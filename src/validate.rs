@@ -137,12 +137,16 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                 }
             }
         }
-        let min = cfg.guide.min_screenshots.unwrap_or(1 + acts.len());
+        let no_data = crate::pages::says_no_data(&src.body);
+        let min = cfg
+            .guide
+            .min_screenshots
+            .unwrap_or_else(|| crate::pages::screenshot_plan_for(&acts, no_data).len());
         let images = LINK.captures_iter(&text).filter(|c| &c[1] == "!").count();
         if images < min {
             out.push(Problem::error(format!(
-                "a page guide with {} action(s) needs at least {min} screenshots; it has {images} (facts lists a screenshot plan)",
-                acts.len()
+                "this page guide needs at least {min} screenshots (the page, one form shot for Add and Edit, one per other action: facts.screenshot_plan); it has {images}{}",
+                if no_data { "" } else { ". If the page has no records to show, put <!-- no-data: why --> in the guide and fewer are needed" }
             )));
         }
     }
