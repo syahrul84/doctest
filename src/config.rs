@@ -47,7 +47,7 @@ pub struct UserCreds {
 }
 
 /// One audience's guide (admin, tenant, vendor…): the pages it holds and the user its screenshots sign in as.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Portal {
     pub name: String,
     pub title: String,

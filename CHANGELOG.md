@@ -16,6 +16,10 @@ Fixes from the first long run on a real project:
 - Masks: `hide`, shadow roots, re-applied on re-render, regex `(?i)`, a note for masks that matched nothing.
   Steps: `wait_text`, `scroll`; `fill` clears the field. `shoot` accepts a flat spec and says when it retook a
   stored one.
+- Work queue: `queue` (guides or tests) and `portals` filters on `claim`, `status` and `plan`, applied when an item
+  is handed out; page facts cached between runs, so a repeat `status` reads only changed pages.
+- A page's fingerprint covers only what its guide depends on, so upgrading doctest no longer marks every guide stale
+  (guides checked with the old format carry over).
 
 - MCP server and CLI for Laravel + Vue 2/3 projects, built on codemap.
 - User guide per page and per language, one guide per portal, checked against the real screen (labels, buttons,

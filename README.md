@@ -168,7 +168,7 @@ The MCP tools behind these commands:
 | Tool | Does |
 | --- | --- |
 | `status`, `plan` | What is missing or stale, with overall progress % (`scope`: `changes` since the last `finish`, `branch` since the branch left `base` (main/master), or `all`) |
-| `claim` | For parallel AI workers: each worker gets its own next items (claims expire after 30 min) |
+| `claim` | For parallel AI workers: each worker gets its own next items (claims expire after 30 min); `queue: "guides"` or `"tests"` keeps guide and test workers apart, `portals: ["admin"]` keeps a worker to some portals (also on `status` and `plan`) |
 | `facts` | Everything for one work item: real labels, texts, endpoints, rules, messages, menu path, skeleton |
 | `write_doc` | Store a guide/translation/system section; refused if it names UI the page lacks |
 | `shoot` | Take or retake a screenshot from a spec; returns the image |
@@ -177,6 +177,9 @@ The MCP tools behind these commands:
 | `issues` | Code to fix, as points |
 | `verify_changes` | Validate the current change: pass/fail with points |
 | `finish` | Record the commits so the next `changes` scope starts here |
+
+`status`, `plan` and `claim` keep each page's facts between runs (under `~/.doctest/cache/`) and read again only
+the pages whose code changed: on a 900-screen app a repeat `status` takes about 20 seconds instead of 3 minutes.
 
 Long calls report progress (`[ 37%] reading pages 170/460`) as MCP progress notifications and on stderr.
 

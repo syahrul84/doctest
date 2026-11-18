@@ -5,6 +5,7 @@ mod check;
 mod codemap;
 mod config;
 mod doctor;
+mod factcache;
 mod git;
 mod hash;
 mod html;

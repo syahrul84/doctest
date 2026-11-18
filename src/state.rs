@@ -26,6 +26,9 @@ pub struct State {
     pub claims: BTreeMap<String, (String, u64)>,
     /// Item → why it is queued.
     pub reasons: BTreeMap<String, String>,
+    /// Item → the portals it belongs to (none: it belongs to every portal, like the system document).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub item_portals: BTreeMap<String, Vec<String>>,
     /// Items written since the last finish (for the changelog).
     pub written: Vec<String>,
     /// When the current run started (unix seconds): the first status, plan or claim after a finish.
@@ -183,7 +186,15 @@ impl State {
             e.fingerprint = p.fingerprint.clone();
             e.files = p.files.clone();
             e.backend_files = p.backend_files.clone();
-            if e.documented_fingerprint.is_none() {
+            let old_format = e
+                .documented_fingerprint
+                .as_deref()
+                .is_some_and(|d| !d.starts_with(crate::pages::FINGERPRINT_VERSION));
+            let migrated = p
+                .documented_fingerprint
+                .as_deref()
+                .is_some_and(|d| d.starts_with(crate::pages::FINGERPRINT_VERSION));
+            if e.documented_fingerprint.is_none() || (old_format && migrated) {
                 e.documented_fingerprint = p.documented_fingerprint.clone();
             }
             for s in &p.shots {
@@ -196,9 +207,15 @@ impl State {
     }
 
     /// Up to `count` queued items not claimed by another worker (claims expire after 30 minutes).
+    #[cfg(test)]
     pub fn claim(&mut self, worker: &str, count: usize, now: u64) -> Vec<String> {
+        self.claim_where(worker, count, now, &|_| true)
+    }
+
+    /// Claims only items `wanted` accepts (a queue, kinds or portals).
+    pub fn claim_where(&mut self, worker: &str, count: usize, now: u64, wanted: &dyn Fn(&str) -> bool) -> Vec<String> {
         let mut out = Vec::new();
-        for id in &self.queue {
+        for id in self.queue.iter().filter(|id| wanted(id)) {
             if out.len() >= count {
                 break;
             }
@@ -221,6 +238,7 @@ impl State {
         self.queue.retain(|q| q != item);
         self.claims.remove(item);
         self.reasons.remove(item);
+        self.item_portals.remove(item);
         if !self.written.iter().any(|w| w == item) {
             self.written.push(item.to_string());
         }

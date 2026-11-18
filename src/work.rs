@@ -135,6 +135,8 @@ pub struct Plan {
     pub missing: BTreeMap<String, Vec<Case>>,
     /// Changed files per repo name (None in scope all / first run).
     pub changed: Option<BTreeMap<String, Vec<PathBuf>>>,
+    /// Pages whose facts came from the cache (their code had not changed).
+    pub cached_pages: usize,
 }
 
 pub const SYSTEM_SECTIONS: [(&str, &str); 5] = [
@@ -339,28 +341,59 @@ pub fn plan_parallel(
             candidates.push(page);
         }
     }
-    progress.step(0, candidates.len(), "reading pages");
-    let computed: Vec<Result<PageFacts, String>> = match factory {
-        Some(f) if cfg.parallel_reads && cfg.workers > 1 && candidates.len() > 1 => {
-            in_parallel(&candidates, cfg.workers, f, progress, "reading pages", &|api, page| {
+    // pages whose code is unchanged since they were last read keep their facts
+    let mut cache = crate::factcache::FactCache::load(cfg, labels.files_hash());
+    let cached: Vec<Option<PageFacts>> = candidates
+        .iter()
+        .map(|p| cache.get(cfg, &p.key).filter(|f| f.page == **p))
+        .collect();
+    let to_read: Vec<&Page> = candidates
+        .iter()
+        .zip(&cached)
+        .filter(|(_, c)| c.is_none())
+        .map(|(p, _)| *p)
+        .collect();
+    progress.step(0, to_read.len(), "reading pages");
+    let read: Vec<Result<PageFacts, String>> = match factory {
+        Some(f) if cfg.parallel_reads && cfg.workers > 1 && to_read.len() > 1 => {
+            in_parallel(&to_read, cfg.workers, f, progress, "reading pages", &|api, page| {
                 let mut fb = FactBuilder::new(api, cfg, &labels);
                 fb.facts(page)
             })
         }
-        _ => candidates
+        _ => to_read
             .iter()
             .enumerate()
             .map(|(n, page)| {
                 let r = fb.facts(page);
-                progress.step(n + 1, candidates.len(), "reading pages");
+                progress.step(n + 1, to_read.len(), "reading pages");
                 r
             })
             .collect(),
     };
+    let mut read = read.into_iter();
+    let mut computed: Vec<Result<PageFacts, String>> = Vec::new();
+    for c in cached {
+        computed.push(match c {
+            Some(f) => Ok(f),
+            None => {
+                let r = read.next().expect("one read per uncached page");
+                if let Ok(f) = &r {
+                    cache.put(cfg, f);
+                }
+                r
+            }
+        });
+    }
+    cache.save();
+    plan.cached_pages = cache.hits;
     for (page, facts) in candidates.iter().zip(computed) {
         let facts = facts?;
         let fp = fingerprint(&facts, labels.files_hash());
         let entry = state.pages.entry(page.key.clone()).or_default();
+        if crate::pages::carries_over(entry.documented_fingerprint.as_deref(), &entry.fingerprint) {
+            entry.documented_fingerprint = Some(fp.clone());
+        }
         entry.fingerprint = fp.clone();
         entry.files = facts.code_files.clone();
         entry.backend_files = facts
@@ -835,6 +868,122 @@ pub fn plan_parallel(
     plan.endpoints = endpoint_list;
     plan.changed = changed;
     Ok(plan)
+}
+
+/// The portals each item belongs to: a page's guide, translation and screenshots its page's portal; a test target
+/// the portals of the pages that call it, else the portal its URI names (`api/selfcare/…`). Items of no portal (the
+/// system document, process guides, unit tests) are left out.
+pub fn item_portals(plan: &Plan, state: &State, cfg: &Config) -> BTreeMap<String, Vec<String>> {
+    let page_portal: BTreeMap<&str, &str> = plan
+        .pages
+        .iter()
+        .filter(|p| !p.portal.is_empty())
+        .map(|p| (p.key.as_str(), p.portal.as_str()))
+        .collect();
+    let mut callers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for f in plan.facts.values() {
+        if f.page.portal.is_empty() {
+            continue;
+        }
+        for e in f.endpoints.iter().filter(|e| !e.possible) {
+            callers
+                .entry(cases::endpoint_target(e))
+                .or_default()
+                .insert(f.page.portal.clone());
+        }
+    }
+    let portals: Vec<crate::config::Portal> = if cfg.guide.portals.is_empty() {
+        plan.pages
+            .iter()
+            .map(|p| p.portal.clone())
+            .filter(|p| !p.is_empty() && p != "public")
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|name| crate::config::Portal {
+                pages: vec![format!("/{name}/*"), format!("{name}.*")],
+                name,
+                ..Default::default()
+            })
+            .collect()
+    } else {
+        cfg.guide.portals.clone()
+    };
+    let mut out = BTreeMap::new();
+    for i in &plan.items {
+        let mut parts = i.id.splitn(3, ':');
+        let kind = parts.next().unwrap_or_default();
+        let found: Vec<String> = match kind {
+            "guide" | "translation" => {
+                let key = parts.nth(1).unwrap_or_default();
+                page_portal.get(key).map(|p| vec![p.to_string()]).unwrap_or_default()
+            }
+            "shot" => {
+                let id = &i.id["shot:".len()..];
+                state
+                    .shots
+                    .get(id)
+                    .and_then(|s| page_portal.get(s.page.as_str()))
+                    .map(|p| vec![p.to_string()])
+                    .unwrap_or_default()
+            }
+            "tests" => {
+                let target = &i.id["tests:".len()..];
+                match callers.get(target) {
+                    Some(set) => set.iter().cloned().collect(),
+                    None => target
+                        .split_once(' ')
+                        .filter(|(m, _)| m.chars().all(|c| c.is_ascii_uppercase()))
+                        .map(|(_, uri)| {
+                            let rest = uri.trim_start_matches('/');
+                            let rest = rest.strip_prefix("api/").unwrap_or(rest);
+                            let rest = rest
+                                .split_once('/')
+                                .filter(|(v, _)| v.len() <= 3 && v.starts_with('v'))
+                                .map(|(_, r)| r)
+                                .unwrap_or(rest);
+                            crate::portals::portal_in(&portals, "", &format!("/{rest}"))
+                        })
+                        .filter(|p| !p.is_empty() && p != "public")
+                        .map(|p| vec![p])
+                        .unwrap_or_default(),
+                }
+            }
+            _ => Vec::new(),
+        };
+        if !found.is_empty() {
+            out.insert(i.id.clone(), found);
+        }
+    }
+    out
+}
+
+/// Item kinds of a queue: `guides` (guides, translations, process guides, screenshots, system document) or `tests`.
+pub fn queue_kinds(queue: &str) -> Result<Vec<String>, String> {
+    match queue {
+        "guides" | "guide" | "docs" => Ok(["guide", "translation", "process", "shot", "doc"]
+            .map(String::from)
+            .to_vec()),
+        "tests" | "test" => Ok(vec!["tests".into()]),
+        "" | "all" => Ok(Vec::new()),
+        other => Err(format!("queue {other:?}: use guides or tests")),
+    }
+}
+
+/// Does an item pass a kinds and portals filter? An item of no portal passes any portal filter unless the filter
+/// asks for `only` portal items.
+pub fn item_wanted(
+    id: &str,
+    kinds: &[String],
+    portals: &[String],
+    item_portals: &BTreeMap<String, Vec<String>>,
+) -> bool {
+    let kind_ok = kinds.is_empty() || kinds.iter().any(|k| id.starts_with(&format!("{k}:")));
+    let portal_ok = portals.is_empty()
+        || match item_portals.get(id) {
+            Some(ps) => ps.iter().any(|p| portals.contains(p)),
+            None => !id.starts_with("guide:") && !id.starts_with("translation:") && !id.starts_with("shot:"),
+        };
+    kind_ok && portal_ok
 }
 
 /// `125` → `2m 5s`.

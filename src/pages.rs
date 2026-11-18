@@ -14,7 +14,7 @@ use crate::codemap::{BACKEND, CodemapApi};
 use crate::config::Config;
 use crate::i18n::{Labels, Node, parse_tree};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     /// Route name, else path.
     pub key: String,
@@ -1411,23 +1411,54 @@ fn walk_menu(node: &Node, module: &str, group: &str, out: &mut Vec<MenuEntry>) {
 }
 
 /// sha256 of the facts in a canonical order, plus the hash of the locale files.
+/// Prefix of the current fingerprint format; fingerprints without it were made by an older doctest.
+pub const FINGERPRINT_VERSION: &str = "v2:";
+
+/// What a page's guide depends on: what the user sees (path, labels, literal texts, menu path) and what its actions
+/// do (endpoints with their rules, permissions and messages). doctest's own bookkeeping (code files, components,
+/// where an action is defined) is left out, so a doctest upgrade does not make every guide stale.
 pub fn fingerprint(f: &PageFacts, labels_hash: &str) -> String {
-    let mut c = f.clone();
-    for v in c.labels.values_mut() {
+    let mut labels = f.labels.clone();
+    for v in labels.values_mut() {
         v.sort();
+        v.dedup();
     }
-    c.literals.sort();
-    c.components.sort();
-    c.menu_titles.sort();
-    for e in c.endpoints.iter_mut() {
-        e.middleware.sort();
-        e.permissions.sort();
-        e.messages.sort();
-    }
-    c.endpoints
-        .sort_by(|a, b| (&a.method, &a.uri).cmp(&(&b.method, &b.uri)));
-    let text = serde_json::to_string(&c).unwrap_or_default();
-    crate::hash::sha256(&format!("{text}\n{labels_hash}"))
+    let mut literals = f.literals.clone();
+    literals.sort();
+    literals.dedup();
+    let mut menu = f.menu_titles.clone();
+    menu.sort();
+    let mut endpoints: Vec<serde_json::Value> = f
+        .endpoints
+        .iter()
+        .map(|e| {
+            let mut perms = e.permissions.clone();
+            perms.sort();
+            let mut msgs = e.messages.clone();
+            msgs.sort();
+            serde_json::json!([e.method, e.uri, e.rules, perms, msgs])
+        })
+        .collect();
+    endpoints.sort_by_key(|v| v.to_string());
+    endpoints.dedup();
+    let text = serde_json::json!({
+        "path": f.page.path,
+        "portal": f.page.portal,
+        "labels": labels,
+        "literals": literals,
+        "menu": menu,
+        "endpoints": endpoints,
+    })
+    .to_string();
+    format!(
+        "{FINGERPRINT_VERSION}{}",
+        crate::hash::sha256(&format!("{text}\n{labels_hash}"))
+    )
+}
+
+/// A guide checked with an older fingerprint format, up to date when it was last planned: it stays up to date.
+pub fn carries_over(documented: Option<&str>, last_fingerprint: &str) -> bool {
+    documented.is_some_and(|d| !d.starts_with(FINGERPRINT_VERSION) && d == last_fingerprint)
 }
 
 #[cfg(test)]
@@ -1744,6 +1775,30 @@ pub(crate) mod tests {
         assert_eq!(empty.len(), 3, "{empty:?}");
         assert!(empty[1].starts_with("Add:"), "{empty:?}");
         assert!(says_no_data("x\n<!-- no-data: no bookings yet -->\n"));
+    }
+
+    #[test]
+    fn fingerprint_ignores_bookkeeping() {
+        let f = sample();
+        let fp = fingerprint(&f, "l");
+        assert!(fp.starts_with(FINGERPRINT_VERSION));
+        let mut g = f.clone();
+        g.code_files.push("src/x.js".into());
+        g.components.push("Extra".into());
+        if let Some(e) = g.endpoints.first_mut() {
+            e.at = Some("app/X.php:9".into());
+            e.middleware.push("auth".into());
+        }
+        if let Some(e) = g.endpoints.last_mut() {
+            e.possible = !e.possible;
+        }
+        assert_eq!(fingerprint(&g, "l"), fp, "internal fields changed the fingerprint");
+        g.literals.push("New button".into());
+        assert_ne!(fingerprint(&g, "l"), fp);
+        assert!(carries_over(Some("abc"), "abc"));
+        assert!(!carries_over(Some("abc"), "def"));
+        assert!(!carries_over(Some(&fp), &fp));
+        assert!(!carries_over(None, "abc"));
     }
 
     #[test]

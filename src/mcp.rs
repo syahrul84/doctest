@@ -80,19 +80,19 @@ pub fn tools() -> Value {
         tool(
             "status",
             "Counts and the first items of what is missing or stale: guides, translations, process guides, screenshots, system document sections, test cases.",
-            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}}),
+            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}, "portals": {"type": "array", "items": {"type": "string"}, "description": "only these portals' items, e.g. [\"admin\",\"selfcare\"] (items of no portal, like the system document, stay)"}, "queue": {"type": "string", "enum": ["guides", "tests"], "description": "guides (guides, translations, screenshots, system document) or tests"}}),
             &[]
         ),
         tool(
             "plan",
             "The ordered work items (id, kind, reason). Work through them with facts → write_doc / shoot / write_test.",
-            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}}),
+            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}, "portals": {"type": "array", "items": {"type": "string"}, "description": "only these portals' items, e.g. [\"admin\",\"selfcare\"] (items of no portal, like the system document, stay)"}, "queue": {"type": "string", "enum": ["guides", "tests"], "description": "guides (guides, translations, screenshots, system document) or tests"}}),
             &[]
         ),
         tool(
             "claim",
-            "For parallel AI workers: hands this worker its own next work items (not claimed by others; claims expire after 30 minutes). Refreshes the queue from a plan when empty or refresh is true.",
-            json!({"worker": {"type": "string"}, "count": {"type": "integer"}, "kinds": {"type": "array", "items": {"type": "string"}}, "refresh": {"type": "boolean"}, "redo": {"type": "boolean"}, "scope": scope, "base": base}),
+            "For parallel AI workers: hands this worker its own next work items (not claimed by others; claims expire after 30 minutes), only of its queue, kinds and portals when given. Refreshes the queue from a plan when empty or refresh is true.",
+            json!({"worker": {"type": "string"}, "count": {"type": "integer"}, "kinds": {"type": "array", "items": {"type": "string"}, "description": "item kinds: guide, translation, process, shot, doc, tests"}, "refresh": {"type": "boolean"}, "redo": {"type": "boolean"}, "scope": scope, "base": base, "portals": {"type": "array", "items": {"type": "string"}, "description": "only these portals' items, e.g. [\"admin\",\"selfcare\"] (items of no portal, like the system document, stay)"}, "queue": {"type": "string", "enum": ["guides", "tests"], "description": "guides (guides, translations, screenshots, system document) or tests"}}),
             &["worker"]
         ),
         tool(
@@ -373,12 +373,25 @@ impl Server {
         let p = self.project(args)?;
         let scope = Scope::parse(s(args, "scope"), s(args, "base"))?;
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(40) as usize;
+        let strings = |k: &str| -> Vec<String> {
+            args.get(k)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let portals = strings("portals");
+        let mut kinds = strings("kinds");
+        kinds.extend(work::queue_kinds(s(args, "queue").unwrap_or(""))?);
         match name {
             "status" | "plan" => {
                 let mut st = State::load(&p.cfg);
                 let mut plan = run_plan(&factory, p, &mut st, &scope, progress)?;
                 if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
                     work::add_redo(&mut plan, &p.cfg, &st);
+                }
+                if !portals.is_empty() || !kinds.is_empty() {
+                    let ip = work::item_portals(&plan, &st, &p.cfg);
+                    plan.items.retain(|i| work::item_wanted(&i.id, &kinds, &portals, &ip));
                 }
                 if name == "status" {
                     text(pretty(&work::status(&plan, &scope, limit)))
@@ -391,11 +404,6 @@ impl Server {
                     .ok_or("worker is required (any name, e.g. w1)")?
                     .to_string();
                 let count = args.get("count").and_then(Value::as_u64).unwrap_or(5) as usize;
-                let kinds: Vec<String> = args
-                    .get("kinds")
-                    .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
                 let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false)
                     || State::load(&p.cfg).queue.is_empty();
                 if refresh {
@@ -404,28 +412,30 @@ impl Server {
                     if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
                         work::add_redo(&mut plan, &p.cfg, &st);
                     }
-                    let items: Vec<&work::WorkItem> = plan
-                        .items
-                        .iter()
-                        .filter(|i| kinds.is_empty() || kinds.iter().any(|k| i.id.starts_with(&format!("{k}:"))))
-                        .collect();
+                    // the whole plan is queued; each worker takes only what its queue, kinds and portals allow
+                    let ip = work::item_portals(&plan, &st, &p.cfg);
+                    let items: Vec<&work::WorkItem> = plan.items.iter().collect();
                     State::update(&p.cfg, |s| {
                         s.queue = items.iter().map(|i| i.id.clone()).collect();
                         s.reasons = items.iter().map(|i| (i.id.clone(), i.reason.clone())).collect();
+                        s.item_portals = ip.clone();
                         let q = s.queue.clone();
                         s.claims.retain(|k, _| q.contains(k));
                     })?;
                 }
                 let (got, left) = State::update(&p.cfg, |s| {
+                    let ip = s.item_portals.clone();
+                    let wanted = |id: &str| work::item_wanted(id, &kinds, &portals, &ip);
                     let got: Vec<(String, String)> = s
-                        .claim(&worker, count, crate::state::now())
+                        .claim_where(&worker, count, crate::state::now(), &wanted)
                         .into_iter()
                         .map(|id| {
                             let r = s.reasons.get(&id).cloned().unwrap_or_default();
                             (id, r)
                         })
                         .collect();
-                    (got, s.queue.len())
+                    let left = s.queue.iter().filter(|id| wanted(id)).count();
+                    (got, left)
                 })?;
                 text(pretty(
                     &json!({"worker": worker, "items": got.iter().map(|(id, r)| json!({"id": id, "reason": r})).collect::<Vec<_>>(), "queued": left, "note": "work these items (facts → write_doc / shoot / write_test); a written item leaves the queue; claims expire after 30 minutes"}),
@@ -2640,6 +2650,92 @@ mod tests {
         let st = State::load(&cfg);
         assert!(!st.queue.contains(&"guide:en:shop.orders.create".to_string()));
         assert!(st.written.contains(&"guide:en:shop.orders.create".to_string()));
+    }
+
+    #[test]
+    fn claim_keeps_guide_and_test_queues_apart() {
+        let (_d, cfg) = project();
+        let mut s = server();
+        let ids = |t: &str| -> Vec<String> {
+            serde_json::from_str::<Value>(t).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (t1, err) = call(
+            &mut s,
+            "claim",
+            json!({"project": cfg.root, "worker": "tests1", "count": 50, "queue": "tests", "scope": "all"}),
+        );
+        assert!(!err, "{t1}");
+        let tests = ids(&t1);
+        assert!(
+            !tests.is_empty() && tests.iter().all(|i| i.starts_with("tests:")),
+            "{tests:?}"
+        );
+        // a guide worker never gets a test item, even though the queue is already full
+        let (g, _) = call(
+            &mut s,
+            "claim",
+            json!({"project": cfg.root, "worker": "g1", "count": 50, "queue": "guides"}),
+        );
+        let guides = ids(&g);
+        assert!(
+            !guides.is_empty() && guides.iter().all(|i| !i.starts_with("tests:")),
+            "{guides:?}"
+        );
+        // a portal nobody has: no page items, only items of no portal
+        let (p, _) = call(
+            &mut s,
+            "plan",
+            json!({"project": cfg.root, "scope": "all", "portals": ["nowhere"], "limit": 500}),
+        );
+        assert!(!p.contains("guide:en:"), "{p}");
+        let (bad, err) = call(
+            &mut s,
+            "claim",
+            json!({"project": cfg.root, "worker": "x", "queue": "pages"}),
+        );
+        assert!(err && bad.contains("guides or tests"), "{bad}");
+    }
+
+    #[test]
+    fn items_belong_to_their_page_portal() {
+        let mut plan = work::Plan::default();
+        let page = |key: &str, portal: &str| crate::pages::Page {
+            key: key.into(),
+            portal: portal.into(),
+            ..Default::default()
+        };
+        plan.pages = vec![page("admin.users", "admin"), page("selfcare.home", "selfcare")];
+        for id in [
+            "guide:en:admin.users",
+            "translation:ms:selfcare.home",
+            "tests:GET api/contractor/jobs",
+            "doc:index",
+        ] {
+            plan.items.push(work::WorkItem {
+                id: id.into(),
+                kind: work::ItemKind::Doc,
+                reason: String::new(),
+            });
+        }
+        let mut cfg = project().1;
+        cfg.guide.portals = vec![crate::config::Portal {
+            name: "contractor".into(),
+            pages: vec!["/contractor/*".into()],
+            ..Default::default()
+        }];
+        let ip = work::item_portals(&plan, &State::default(), &cfg);
+        assert_eq!(ip["guide:en:admin.users"], vec!["admin"]);
+        assert_eq!(ip["translation:ms:selfcare.home"], vec!["selfcare"]);
+        assert_eq!(ip["tests:GET api/contractor/jobs"], vec!["contractor"]);
+        let want = vec!["admin".to_string(), "selfcare".to_string()];
+        assert!(work::item_wanted("guide:en:admin.users", &[], &want, &ip));
+        assert!(!work::item_wanted("tests:GET api/contractor/jobs", &[], &want, &ip));
+        assert!(work::item_wanted("doc:index", &[], &want, &ip));
     }
 
     #[test]
