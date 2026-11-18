@@ -1,0 +1,1 @@
+{"data":{"found":true,"name":"store","fqn":"App\\Http\\Controllers\\OrderController::store","kind":"method","file":"app/Http/Controllers/OrderController.php","line":9,"end_line":20,"meta":{"params":[{"name":"$request","type":"Request","type_fqns":["Illuminate\\Http\\Request"]}]}},"meta":{"project":"shop"}}

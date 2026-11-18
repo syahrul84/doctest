@@ -1,0 +1,9 @@
+<!doctype html><html><body style="width:2400px">
+<div class="admin-layout">
+  <h1>Orders <span id="who"></span></h1>
+  <div class="card"><span class="customer-name">Real Customer</span> unit AB-12-34 <input class="email" value="real@corp.com"></div>
+  <button id="more" onclick="document.getElementById('extra').style.display='block'">More</button>
+  <div id="extra" style="display:none">Extra panel</div>
+</div>
+<script>document.getElementById('who').textContent = localStorage.getItem('user') || 'nobody';</script>
+</body></html>
