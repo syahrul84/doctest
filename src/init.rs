@@ -139,7 +139,7 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
         },
         q(&langs)
     );
-    t += "[app]   # the running app used for screenshots\nbase_url = \"http://localhost:8000\"   # TODO\nlogin_url = \"/login\"   # TODO\nlogin_steps = [   # TODO: selectors of your sign-in form\n  { fill = \"input[name=email]\", value = \"$user\" },\n  { fill = \"input[name=password]\", value = \"$password\" },\n  { click = \"button[type=submit]\" },\n]\n\n[app.users.admin]   # TODO: set these env vars to a test admin account\nuser_env = \"DOCTEST_USER\"\npassword_env = \"DOCTEST_PASSWORD\"\n\n";
+    t += "[app]   # the running app used for screenshots\nbase_url = \"http://localhost:8000\"   # TODO\nlogin_url = \"/login\"   # TODO\nlogin_steps = [   # only for unattended runs with [app.users]: selectors of your sign-in form\n  { fill = \"input[name=email]\", value = \"$user\" },\n  { fill = \"input[name=password]\", value = \"$password\" },\n  { click = \"button[type=submit]\" },\n]\n\n# Screenshots of signed-in pages: run `doctest login` once and sign in by hand in the window it opens.\n# For unattended runs instead, name env vars holding a test login:\n# [app.users.admin]\n# user_env = \"DOCTEST_USER\"\n# password_env = \"DOCTEST_PASSWORD\"\n\n";
     t += "[screenshots]\nmax_width = 1600\nmask = [   # TODO: replace names and numbers that may be real data\n]\n\n";
     t += "[tests]\nrun = \"php artisan test {filter}\"   # TODO: e.g. docker exec <container> sh -c 'cd /app && php artisan test {filter}'\n\n";
     t += &format!("[guide]\n{}allow_bold = []\n", match menu.as_ref().map(|(_, m)| m) {

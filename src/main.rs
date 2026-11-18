@@ -117,6 +117,14 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sign in to the app once in a Chrome window doctest opens (OTP is fine); screenshots reuse that session
+    Login {
+        /// The [app.users] name (or portal user) to sign in as; default: the first, else "default"
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Check what doctest needs and what to fix
     Doctor {
         #[arg(long, default_value = ".")]
@@ -321,6 +329,17 @@ fn main() -> ExitCode {
                 dry_run,
             };
             setup::run(&opts, &setup::claude_cli).map(|t| (t, true))
+        })(),
+        Command::Login { user, project } => (|| {
+            let cfg = load(&project)?;
+            let user = user.unwrap_or_else(|| shots::default_user(&cfg));
+            let (login_url, _) = cfg.login_for(&user);
+            eprintln!(
+                "Opening Chrome on {}{login_url} — sign in as {user}; the window closes by itself once you are in.",
+                cfg.app.base_url
+            );
+            shots::login(&cfg, &user, false, &|_| {})
+                .map(|u| (format!("signed in as {u}; screenshots will reuse this session (run `doctest login` again when it expires)"), true))
         })(),
         Command::Doctor { project } => {
             let start = std::fs::canonicalize(&project).unwrap_or(project);

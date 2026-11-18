@@ -61,15 +61,10 @@ login_steps = [
 ]
 locale_steps = [ { goto = "/admin?lang=$lang" } ]   # how to switch the UI language, if you have several
 
-[app.users.admin]                     # a test account; values come from these env vars
-user_env = "DOCTEST_USER"
-password_env = "DOCTEST_PASSWORD"
-
-[app.users.tenant]                    # another portal signs in elsewhere
-user_env = "DOCTEST_TENANT_USER"
-password_env = "DOCTEST_TENANT_PASSWORD"
-login_url = "/selfcare/login"
-login_steps = [ { fill = "#email", value = "$user" }, { fill = "#password", value = "$password" }, { click = "button[type=submit]" } ]
+# Screenshots sign in through `doctest login` (below). Only for unattended runs, name env vars with a test login:
+# [app.users.admin]
+# user_env = "DOCTEST_USER"
+# password_env = "DOCTEST_PASSWORD"
 
 [screenshots]
 max_width = 1600
@@ -104,6 +99,17 @@ user = "tenant"
 workers = 4                           # AI workers claiming items, tool calls at the same time
 # parallel_reads = true               # also read pages with several codemap clients (off: slower on big apps)
 ```
+
+## Signing in for screenshots
+
+```bash
+doctest login                 # a Chrome window opens on the sign-in page; sign in by hand (OTP is fine)
+doctest login --user tenant   # another portal's user
+```
+
+doctest keeps that session in its own Chrome profile (under `~/.doctest/chrome/`, separate from your browser) and
+every screenshot reuses it. No password is stored. When the session expires, doctest says so; run `doctest login`
+again (or let the AI call the `login` tool, which opens the same window).
 
 ## Use
 

@@ -149,6 +149,12 @@ pub fn tools() -> Value {
             json!({}),
             &[]
         ),
+        tool(
+            "login",
+            "Open a Chrome window on the app's sign-in page for the person to sign in by hand (OTP is fine); screenshots then reuse that session. Call it when shoot says it is not signed in or the session expired, and tell the person a window is opening.",
+            json!({"user": {"type": "string", "description": "the [app.users] or portal user; default the first, else default"}}),
+            &[]
+        ),
     ])
 }
 
@@ -428,6 +434,20 @@ impl Server {
                     &json!({"passed": r.passed(), "errors": r.errors, "warnings": r.warnings, "known_bugs": r.bugs, "code_to_fix": points}),
                 ))
             }
+            "login" => {
+                let user = s(args, "user")
+                    .map(String::from)
+                    .unwrap_or_else(|| crate::shots::default_user(&p.cfg));
+                progress.step(
+                    0,
+                    1,
+                    &format!("waiting for the person to sign in as {user} in the Chrome window"),
+                );
+                let u = crate::shots::login(&p.cfg, &user, false, &|_| {})?;
+                p.shooter = None; // the next shoot starts from the new session
+                progress.step(1, 1, "signed in");
+                text(format!("signed in as {u}; screenshots reuse this session"))
+            }
             "issues" => {
                 let mut points = Vec::new();
                 match scope {
@@ -598,6 +618,8 @@ pub fn summary(tool: &str, outcome: Result<&str, &str>, elapsed: std::time::Dura
                 "drop those rows (existing tests cover them) and send the rest"
             } else if e.contains("rolled back") {
                 "fix method_php (or the rows) as the message says and send write_test again"
+            } else if e.contains("doctest login") {
+                "call the login tool (a Chrome window opens for the person to sign in), then shoot again"
             } else if e.contains(" is required")
                 || e.contains("bad item")
                 || e.contains("not in [project]")
@@ -845,6 +867,7 @@ pub fn summary(tool: &str, outcome: Result<&str, &str>, elapsed: std::time::Dura
                         },
                     )
                 }
+                "login" => ("signed in".into(), "shoot the screenshots again".into()),
                 "report_problem" => (
                     "problem recorded".into(),
                     "tell the person the id and `doctest reports --send <id>`".into(),
@@ -917,7 +940,7 @@ pub fn prompt_text(name: &str, words: &[String]) -> Option<String> {
     Some(format!(
         "Document and test {what} with doctest (scope \"{scope_word}\"{redo_note}). Keep going without asking me unless you are blocked. Every doctest reply ends with a summary (took / found / next): follow its next line, and keep the times and findings for your report.
 
-1. Call the doctor tool. If there is no .doctest.toml, run `doctest init` in the Laravel repo, then fill its TODO lines from the project itself (codemap: the login page and its fields, locale files, menu file, portals from route-name prefixes, the test command and container, the app's local URL). Ask me only for the test login (DOCTEST_USER / DOCTEST_PASSWORD) when screenshots need it and it is not set.
+1. Call the doctor tool. If there is no .doctest.toml, run `doctest init` in the Laravel repo, then fill its TODO lines from the project itself (codemap: the login page and its fields, locale files, menu file, portals from route-name prefixes, the test command and container, the app's local URL). If shoot says it is not signed in (or the session expired), call the login tool: a Chrome window opens for me to sign in by hand; tell me it is opening and wait.
 2. Call status with {{{args}}} and tell me the counts and the progress percentages.
 3. {work}
    Item rules — for every item call facts first, then:
@@ -1751,7 +1774,8 @@ mod tests {
                 "verify_changes",
                 "finish",
                 "report_problem",
-                "doctor"
+                "doctor",
+                "login"
             ]
         );
         assert!(

@@ -190,26 +190,55 @@ pub fn run(cfg: Option<&Config>, start: &Path) -> Vec<Check> {
             )
         });
     }
-    let unset: Vec<String> = cfg
-        .app
-        .users
-        .iter()
-        .flat_map(|(_, c)| [c.user_env.clone(), c.password_env.clone()])
-        .filter(|v| std::env::var(v).is_err())
-        .collect();
-    out.push(if cfg.app.users.is_empty() {
+    // every user screenshots sign in as: [app.users], portal users, else "default"
+    let mut users: Vec<String> = cfg.app.users.iter().map(|(n, _)| n.clone()).collect();
+    for p in &cfg.guide.portals {
+        if let Some(u) = &p.user
+            && !users.contains(u)
+        {
+            users.push(u.clone());
+        }
+    }
+    if users.is_empty() {
+        users.push(crate::shots::default_user(cfg));
+    }
+    let missing: Vec<String> =
+        users
+            .iter()
+            .filter(|u| {
+                let by_env =
+                    cfg.app.users.iter().find(|(n, _)| n == *u).is_some_and(|(_, c)| {
+                        std::env::var(&c.user_env).is_ok() && std::env::var(&c.password_env).is_ok()
+                    });
+                !crate::shots::signed_in(cfg, u) && !by_env
+            })
+            .cloned()
+            .collect();
+    out.push(if cfg.app.login_url.is_empty() && cfg.app.users.is_empty() {
         check(
             "test login",
-            Status::Warn,
-            "no [app.users]: screenshots of signed-in pages are not possible",
+            Status::Ok,
+            "no sign-in page configured: screenshots open pages directly",
         )
-    } else if unset.is_empty() {
-        check("test login", Status::Ok, format!("{} user(s) set", cfg.app.users.len()))
+    } else if missing.is_empty() {
+        check("test login", Status::Ok, format!("signed in: {}", users.join(", ")))
     } else {
         check(
             "test login",
             Status::Warn,
-            format!("set {} for screenshots", unset.join(", ")),
+            format!(
+                "not signed in as {}: run {} (a Chrome window opens; sign in by hand)",
+                missing.join(", "),
+                missing
+                    .iter()
+                    .map(|u| if u == "default" {
+                        "`doctest login`".to_string()
+                    } else {
+                        format!("`doctest login --user {u}`")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         )
     });
     let first = cfg.tests.run.split_whitespace().next().unwrap_or_default().to_string();
@@ -265,7 +294,8 @@ mod tests {
 
     #[test]
     fn doctor_reports_each_part() {
-        let (_d, cfg) = crate::work::tests::project();
+        let (_d, mut cfg) = crate::work::tests::project();
+        cfg.app.login_url = "/login".into();
         let checks = run(Some(&cfg), &cfg.root);
         let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
         for want in [
@@ -286,6 +316,7 @@ mod tests {
         }
         let login = checks.iter().find(|c| c.name == "test login").unwrap();
         assert_eq!(login.status, Status::Warn, "{login:?}");
+        assert!(login.detail.contains("doctest login"), "{login:?}");
         assert!(render(&checks).contains("doctest"));
     }
 

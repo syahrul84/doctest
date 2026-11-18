@@ -10,6 +10,7 @@ use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use crate::config::{Config, Mask, Step};
 
@@ -102,6 +103,135 @@ struct Session {
     _browser: Browser,
     tab: Arc<Tab>,
     lang: Option<String>,
+    /// A private copy of the saved sign-in profile (one Chrome profile cannot be open twice).
+    _profile: Option<tempfile::TempDir>,
+}
+
+/// The user screenshots sign in as when a spec and its portal name none: the first [app.users], else "default".
+pub fn default_user(cfg: &Config) -> String {
+    cfg.app
+        .users
+        .first()
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| "default".into())
+}
+
+/// doctest's own Chrome profile for a project and user, holding the session `doctest login` saved.
+pub fn profile_dir(cfg: &Config, user: &str) -> PathBuf {
+    let project = &crate::hash::sha256(&cfg.root.to_string_lossy())[..12];
+    crate::reports::tool_root()
+        .join("chrome")
+        .join(project)
+        .join(crate::source::slug(user))
+}
+
+const SIGNED_IN: &str = ".doctest-signed-in";
+
+/// `doctest login` saved a session for this user.
+pub fn signed_in(cfg: &Config, user: &str) -> bool {
+    profile_dir(cfg, user).join(SIGNED_IN).is_file()
+}
+
+/// Copies a Chrome profile without its caches and lock files.
+pub fn copy_profile(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.contains("Cache")
+            || name.starts_with("Singleton")
+            || name == "Crashpad"
+            || name == "lockfile"
+            || name.ends_with(".lock")
+        {
+            continue;
+        }
+        let (src, dst) = (e.path(), to.join(&name));
+        if src.is_dir() {
+            copy_profile(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn launch(chrome: &Path, headless: bool, profile: Option<&Path>) -> Result<(Browser, Arc<Tab>), String> {
+    let opts = LaunchOptions::default_builder()
+        .path(Some(chrome.to_path_buf()))
+        .headless(headless)
+        .window_size(Some((1440, 900)))
+        .user_data_dir(profile.map(Path::to_path_buf))
+        .idle_browser_timeout(Duration::from_secs(900))
+        .build()
+        .map_err(|e| format!("cannot start Chrome: {e}"))?;
+    let browser = Browser::new(opts).map_err(|e| format!("cannot start Chrome: {e}"))?;
+    let tab = browser.new_tab().map_err(|e| format!("cannot open a tab: {e}"))?;
+    tab.set_default_timeout(Duration::from_secs(20));
+    Ok((browser, tab))
+}
+
+fn on_login_page(url: &str, login_url: &str) -> bool {
+    let path = url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split_once('/'))
+        .map(|(_, p)| format!("/{p}"))
+        .unwrap_or_default();
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    !login_url.is_empty() && (path == login_url || path.trim_end_matches('/') == login_url.trim_end_matches('/'))
+}
+
+/// `doctest login`: opens Chrome on the app's sign-in page with doctest's own profile for `user`, waits until the
+/// person has signed in (the page leaves the sign-in URL; OTP and all), and keeps that session for screenshots.
+/// `driver` lets tests sign in through the same window.
+pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) -> Result<String, String> {
+    let chrome = chrome_path().ok_or("Chrome not found; install Google Chrome or set CHROME_PATH")?;
+    if cfg.app.base_url.is_empty() {
+        return Err("[app] base_url is not set in .doctest.toml".into());
+    }
+    let (login_url, _) = cfg.login_for(user);
+    let profile = profile_dir(cfg, user);
+    std::fs::create_dir_all(&profile).map_err(|e| format!("cannot create {}: {e}", profile.display()))?;
+    let _ = std::fs::remove_file(profile.join(SIGNED_IN));
+    let (browser, tab) = launch(&chrome, headless, Some(&profile))?;
+    let start = format!("{}{}", cfg.app.base_url, login_url);
+    tab.navigate_to(&start)
+        .and_then(|t| t.wait_until_navigated())
+        .map_err(|e| format!("cannot open {start}: {e}"))?;
+    driver(&tab);
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    let mut away = 0;
+    let mut last = start.clone();
+    loop {
+        std::thread::sleep(Duration::from_millis(700));
+        let url = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tab.get_url())) {
+            Ok(u) if !u.is_empty() => u,
+            _ => break, // the window was closed
+        };
+        if !url.starts_with("about:") {
+            last = url.clone();
+        }
+        away = if on_login_page(&url, &login_url) || url.starts_with("about:") {
+            0
+        } else {
+            away + 1
+        };
+        if away >= 3 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    if on_login_page(&last, &login_url) || last.starts_with("about:") {
+        return Err(format!(
+            "not signed in: the window closed or 10 minutes passed on {start}"
+        ));
+    }
+    // let the app finish storing its token, then close Chrome cleanly so the session is written to disk
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = tab.call_method(headless_chrome::protocol::cdp::Browser::Close(None));
+    std::thread::sleep(Duration::from_secs(1));
+    drop(browser);
+    std::fs::write(profile.join(SIGNED_IN), chrono::Utc::now().to_rfc3339()).map_err(|e| e.to_string())?;
+    Ok(user.to_string())
 }
 
 pub struct Shooter {
@@ -217,23 +347,33 @@ impl Shooter {
     }
 
     fn session(&mut self, user: Option<&str>, lang: &str) -> Result<Arc<Tab>, String> {
-        let user = user
-            .map(String::from)
-            .or_else(|| self.cfg.app.users.first().map(|(n, _)| n.clone()))
-            .unwrap_or_default();
+        let user = user.map(String::from).unwrap_or_else(|| default_user(&self.cfg));
         let base = self.cfg.app.base_url.clone();
         if !self.sessions.contains_key(&user) {
-            let opts = LaunchOptions::default_builder()
-                .path(Some(self.chrome.clone()))
-                .headless(true)
-                .window_size(Some((1440, 900)))
-                .build()
-                .map_err(|e| format!("cannot start Chrome: {e}"))?;
-            let browser = Browser::new(opts).map_err(|e| format!("cannot start Chrome: {e}"))?;
-            let tab = browser.new_tab().map_err(|e| format!("cannot open a tab: {e}"))?;
-            tab.set_default_timeout(Duration::from_secs(20));
             let (login, login_steps) = self.cfg.login_for(&user);
-            if !user.is_empty() && !login.is_empty() {
+            // the session `doctest login` saved, in a private copy; else sign in with the configured env vars
+            let saved = signed_in(&self.cfg, &user);
+            let copy = if saved {
+                let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+                copy_profile(&profile_dir(&self.cfg, &user), dir.path())
+                    .map_err(|e| format!("cannot copy the saved session: {e}"))?;
+                Some(dir)
+            } else {
+                None
+            };
+            let (browser, tab) = launch(&self.chrome, true, copy.as_ref().map(|d| d.path()))?;
+            let has_creds = self.cfg.app.users.iter().any(|(n, _)| *n == user);
+            if !saved && !login.is_empty() && !has_creds {
+                return Err(format!(
+                    "not signed in as {user}: run `doctest login{}` once — a Chrome window opens, you sign in by hand (OTP is fine), and screenshots reuse that session",
+                    if user == "default" {
+                        String::new()
+                    } else {
+                        format!(" --user {user}")
+                    }
+                ));
+            }
+            if !saved && !login.is_empty() {
                 let (u, p) = self.creds(&user)?;
                 tab.navigate_to(&format!("{base}{login}"))
                     .and_then(|t| t.wait_until_navigated())
@@ -250,6 +390,7 @@ impl Shooter {
                     _browser: browser,
                     tab,
                     lang: None,
+                    _profile: copy,
                 },
             );
         }
@@ -276,6 +417,18 @@ impl Shooter {
             .and_then(|t| t.wait_until_navigated())
             .map_err(|e| format!("cannot open {base}{path}: {e}"))?;
         std::thread::sleep(Duration::from_millis(400));
+        let user = self.current.clone().unwrap_or_default();
+        let (login_url, _) = self.cfg.login_for(&user);
+        if !path.starts_with(&login_url) && on_login_page(&tab.get_url(), &login_url) {
+            return Err(format!(
+                "the app sent the screenshot to its sign-in page: the saved session for {user} has expired — run `doctest login{}` again",
+                if user == "default" {
+                    String::new()
+                } else {
+                    format!(" --user {user}")
+                }
+            ));
+        }
         let lang = spec.lang.clone();
         let subst = move |v: &str| v.replace("$lang", &lang);
         for (i, step) in spec.steps.iter().enumerate() {
@@ -400,6 +553,41 @@ mod tests {
         assert!(validate_spec(&s).unwrap_err().contains("id"));
     }
 
+    #[test]
+    fn profile_folder_per_project_and_user() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = cfg_in(d.path(), "");
+        let a = profile_dir(&cfg, "admin");
+        let b = profile_dir(&cfg, "tenant");
+        assert_ne!(a, b);
+        assert!(a.starts_with(crate::reports::tool_root().join("chrome")));
+        assert!(a.ends_with("admin"));
+        assert!(!signed_in(&cfg, "nobody-here"));
+    }
+
+    #[test]
+    fn profile_copy_skips_locks_and_caches() {
+        let d = tempfile::tempdir().unwrap();
+        let from = d.path().join("p");
+        std::fs::create_dir_all(from.join("Default/Cache")).unwrap();
+        std::fs::create_dir_all(from.join("Default/Local Storage")).unwrap();
+        std::fs::write(from.join("Default/Cookies"), "c").unwrap();
+        std::fs::write(from.join("Default/Local Storage/x.ldb"), "l").unwrap();
+        std::fs::write(from.join("Default/Cache/big"), "x").unwrap();
+        std::fs::write(from.join("SingletonLock"), "").unwrap();
+        let to = d.path().join("copy");
+        copy_profile(&from, &to).unwrap();
+        assert!(to.join("Default/Cookies").is_file() && to.join("Default/Local Storage/x.ldb").is_file());
+        assert!(!to.join("Default/Cache").exists() && !to.join("SingletonLock").exists());
+    }
+
+    #[test]
+    fn user_name_defaults_to_default() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = cfg_in(d.path(), "");
+        assert_eq!(default_user(&cfg), "default");
+    }
+
     /// Serves tests/fixtures/static-app on 127.0.0.1:<port>.
     fn serve() -> u16 {
         use std::io::{Read, Write};
@@ -478,6 +666,34 @@ mod tests {
         assert!(!text.contains("AB-12-34") && text.contains("D-01-01"), "{text}");
         assert!(text.contains("demo") && text.contains("Extra panel"));
         assert_eq!(sh.input_value(".email").unwrap(), "demo@example.com");
+    }
+
+    #[test]
+    #[ignore = "needs Chrome"]
+    fn login_once_then_screenshots_reuse_the_session() {
+        let port = serve();
+        let d = tempfile::tempdir().unwrap();
+        // DOCTEST_HOME keeps the test profile out of ~/.doctest; only this ignored test sets it
+        unsafe { std::env::set_var("DOCTEST_HOME", d.path().join("home")) };
+        let cfg = cfg_in(
+            d.path(),
+            &format!("[app]\nbase_url=\"http://127.0.0.1:{port}\"\nlogin_url=\"/login.html\"\n"),
+        );
+        // the person signs in by hand; the test does it through the same window
+        let user = login(&cfg, "default", false, &|tab: &Tab| {
+            tab.wait_for_element("[name=username]").unwrap().click().unwrap();
+            tab.type_str("handmade").unwrap();
+            tab.wait_for_element("button[type=submit]").unwrap().click().unwrap();
+        })
+        .unwrap();
+        assert_eq!(user, "default");
+        assert!(signed_in(&cfg, "default"));
+        let mut sh = Shooter::start(&cfg).unwrap();
+        sh.capture(&spec("/orders.html")).unwrap();
+        assert!(
+            sh.page_text().unwrap().contains("handmade"),
+            "the saved session (local storage) is reused"
+        );
     }
 
     #[test]
