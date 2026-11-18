@@ -44,6 +44,10 @@ pub struct Endpoint {
     pub permissions: Vec<String>,
     pub rules: BTreeMap<String, Vec<String>>,
     pub messages: Vec<String>,
+    /// Only reachable through shared code (a shared screen, a layout, a composable or API module): the page may
+    /// not offer it. Its action counts only when the page shows a matching button.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub possible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +95,8 @@ pub struct FactBuilder<'a> {
     pub portals: Vec<crate::config::Portal>,
     /// Filament page key → (codemap meta, resource file).
     filament: HashMap<String, (String, String)>,
+    /// (app, component file) → how many pages render it as their screen.
+    page_components: HashMap<(String, PathBuf), usize>,
 }
 
 impl<'a> FactBuilder<'a> {
@@ -114,6 +120,7 @@ impl<'a> FactBuilder<'a> {
             stale: false,
             portals: cfg.guide.portals.clone(),
             filament: HashMap::new(),
+            page_components: HashMap::new(),
         }
     }
 
@@ -251,6 +258,10 @@ impl<'a> FactBuilder<'a> {
                 },
             );
         }
+        self.page_components.clear();
+        for p in &all {
+            *self.page_components.entry((p.app.clone(), p.component.clone())).or_default() += 1;
+        }
         if self.portals.is_empty() {
             let screens: Vec<crate::portals::Screen> = all
                 .iter()
@@ -296,15 +307,18 @@ impl<'a> FactBuilder<'a> {
         let mut code_files: BTreeSet<String> = BTreeSet::new();
         let mut composable_names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut queue: Vec<(String, usize)> = vec![(page.component.to_string_lossy().into_owned(), 0)];
+        // files whose calls are certainly this page's: its own components, not a shared screen or a layout
+        let mut certain_files: BTreeSet<String> = BTreeSet::new();
+        let mut uncertain: BTreeSet<String> = BTreeSet::new();
         while let Some((file, depth)) = queue.pop() {
             if components.contains(&file) {
                 continue;
             }
             components.push(file.clone());
             code_files.insert(file.clone());
-            if let Ok(text) = std::fs::read_to_string(dir.join(&file)) {
-                literals.extend(template_literals(&text));
-            }
+            let text = std::fs::read_to_string(dir.join(&file)).unwrap_or_default();
+            literals.extend(template_literals(&text));
+            let pages_using = self.page_components.get(&(page.app.clone(), PathBuf::from(&file))).copied().unwrap_or(0);
             let name = Path::new(&file)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -319,6 +333,13 @@ impl<'a> FactBuilder<'a> {
                     c
                 }
             };
+            let used_by = c["used_by"].as_array().map(Vec::len).unwrap_or(0);
+            let under_shared = uncertain.contains(&file);
+            if under_shared || is_layout(&text) || is_shared(pages_using, used_by) {
+                uncertain.insert(file.clone());
+            } else {
+                certain_files.insert(file.clone());
+            }
             if c["found"] != true {
                 continue;
             }
@@ -339,6 +360,10 @@ impl<'a> FactBuilder<'a> {
                     && depth < 3
                     && dir.join(&target).is_file()
                 {
+                    // what a layout or shared screen renders is shared too
+                    if uncertain.contains(&file) {
+                        uncertain.insert(target.clone());
+                    }
                     queue.push((target, depth + 1));
                 }
             }
@@ -409,10 +434,16 @@ impl<'a> FactBuilder<'a> {
                     continue;
                 };
                 let method = methods.split('|').next().unwrap_or_default().to_string();
-                if seen.insert((method.clone(), uri.to_string()))
-                    && let Some(e) = self.endpoint(&method, uri)?
+                let possible = !certain_files.contains(&f);
+                if seen.insert((method.clone(), uri.to_string())) {
+                    if let Some(mut e) = self.endpoint(&method, uri)? {
+                        e.possible = possible;
+                        endpoints.push(e);
+                    }
+                } else if !possible
+                    && let Some(e) = endpoints.iter_mut().find(|e| e.method == method && e.uri == uri)
                 {
-                    endpoints.push(e);
+                    e.possible = false;
                 }
             }
         }
@@ -777,29 +808,92 @@ fn reads_as_success(m: &str) -> bool {
             .any(|w| l.contains(w))
 }
 
-/// The page's actions, one per name, in the order of its endpoints.
+/// A layout: a component that renders the routed page inside it.
+pub fn is_layout(vue: &str) -> bool {
+    vue.contains("<router-view") || vue.contains("<RouterView") || vue.contains("<nuxt-page") || vue.contains("<NuxtPage")
+}
+
+/// A screen many routes share (route props such as `{kind}` pick what it shows), or a component used all over.
+pub fn is_shared(pages_using: usize, used_by: usize) -> bool {
+    pages_using >= 2 || used_by >= 3
+}
+
+/// Button words that show an action is offered on the page.
+fn button_words(action: &str) -> &'static [&'static str] {
+    match action {
+        "Add" => &["new", "add", "create", "save", "submit"],
+        "Edit" => &["edit", "update", "save"],
+        "Delete" => &["delete", "remove", "trash"],
+        "Export" => &["export", "excel", "xls", "pdf", "download", "print"],
+        "Import" => &["import", "upload"],
+        "Approve" => &["approve"],
+        "Reject" => &["reject"],
+        "Submit" => &["submit", "send"],
+        "Cancel" => &["cancel"],
+        "Void" => &["void"],
+        "Generate" => &["generate"],
+        "Send" => &["send", "email"],
+        "Restore" => &["restore"],
+        "Duplicate" | "Copy" => &["duplicate", "copy", "clone"],
+        "Terminate" => &["terminate"],
+        "Renew" => &["renew"],
+        "Publish" => &["publish"],
+        "Post" => &["post"],
+        "Upload" => &["upload"],
+        "Download" | "Print" => &["download", "print"],
+        _ => &[],
+    }
+}
+
+fn shows_button(f: &PageFacts, action: &str) -> bool {
+    let words = button_words(action);
+    let texts = f.labels.values().flatten().chain(&f.literals);
+    texts.into_iter().any(|t| {
+        let lower = t.to_lowercase();
+        lower.split(|c: char| !c.is_alphanumeric()).any(|w| words.contains(&w))
+    })
+}
+
+fn action_of(e: &Endpoint, name: String) -> Action {
+    let (success, errors): (Vec<String>, Vec<String>) = e.messages.iter().cloned().partition(|m| reads_as_success(m));
+    Action {
+        name,
+        endpoint: format!("{} {}", e.method, e.uri),
+        fields: e.rules.keys().cloned().collect(),
+        required: e.rules.iter().filter(|(_, r)| r.iter().any(|x| x == "required")).map(|(k, _)| k.clone()).collect(),
+        success,
+        errors,
+    }
+}
+
+/// Actions the page may offer (reached only through shared code, no matching button on screen): document one only
+/// when the page shows it.
+pub fn possible_actions(f: &PageFacts) -> Vec<Action> {
+    let certain: Vec<String> = actions(f).into_iter().map(|a| a.name).collect();
+    let mut out: Vec<Action> = Vec::new();
+    for e in f.endpoints.iter().filter(|e| e.possible) {
+        let Some(name) = action_name(e) else { continue };
+        if certain.contains(&name) || out.iter().any(|a| a.name == name) {
+            continue;
+        }
+        out.push(action_of(e, name));
+    }
+    out
+}
+
+/// The page's actions, one per name, in the order of its endpoints: calls its own components make, and calls from
+/// shared code when the page shows a matching button.
 pub fn actions(f: &PageFacts) -> Vec<Action> {
     let mut out: Vec<Action> = Vec::new();
     for e in &f.endpoints {
         let Some(name) = action_name(e) else { continue };
+        if e.possible && !shows_button(f, &name) {
+            continue;
+        }
         if out.iter().any(|a| a.name == name) {
             continue;
         }
-        let (success, errors): (Vec<String>, Vec<String>) =
-            e.messages.iter().cloned().partition(|m| reads_as_success(m));
-        out.push(Action {
-            name,
-            endpoint: format!("{} {}", e.method, e.uri),
-            fields: e.rules.keys().cloned().collect(),
-            required: e
-                .rules
-                .iter()
-                .filter(|(_, r)| r.iter().any(|x| x == "required"))
-                .map(|(k, _)| k.clone())
-                .collect(),
-            success,
-            errors,
-        });
+        out.push(action_of(e, name));
     }
     out
 }
@@ -1595,6 +1689,31 @@ pub(crate) mod tests {
             "{plan:?}"
         );
         assert!(plan.iter().any(|s| s.contains("validation error")), "{plan:?}");
+    }
+
+    #[test]
+    fn possible_actions_need_a_button_on_the_page() {
+        let mut f = sample();
+        let mut del = ep("DELETE", "api/assets/depreciation/{id}", &["Record successfully deleted."], &[]);
+        del.possible = true;
+        let mut approve = ep("POST", "api/bookings/{id}/approve", &[], &[]);
+        approve.possible = true;
+        f.endpoints = vec![ep("POST", "api/categories", &[], &[]), del, approve];
+        f.literals = vec!["New".into(), "Approve".into()];
+        let names: Vec<String> = actions(&f).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["Add", "Approve"], "a shared module's Delete without a Delete button is not this page's action");
+        let maybe: Vec<String> = possible_actions(&f).into_iter().map(|a| a.name).collect();
+        assert_eq!(maybe, vec!["Delete"]);
+    }
+
+    #[test]
+    fn layouts_and_shared_screens() {
+        assert!(is_layout("<template><v-app><Header/><router-view /></v-app></template>"));
+        assert!(is_layout("<template><RouterView></RouterView></template>"));
+        assert!(!is_layout("<template><div>Orders</div></template>"));
+        assert!(is_shared(2, 0), "a component behind two routes (route props such as {{kind}}) is a shared screen");
+        assert!(is_shared(1, 3));
+        assert!(!is_shared(1, 1));
     }
 
     #[test]
