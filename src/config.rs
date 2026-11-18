@@ -320,15 +320,7 @@ impl Config {
 
     /// The portal a page belongs to: the first whose patterns match; "other" when none does; "" without portals.
     pub fn portal_of(&self, key: &str, path: &str) -> String {
-        if self.guide.portals.is_empty() {
-            return String::new();
-        }
-        self.guide
-            .portals
-            .iter()
-            .find(|p| crate::work::page_matches(key, path, &p.pages))
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "other".into())
+        crate::portals::portal_in(&self.guide.portals, key, path)
     }
 
     /// The user a portal's screenshots sign in as.
@@ -477,7 +469,7 @@ allow_bold = ["Note"]
         assert_eq!(cfg.guide.portals[1].title, "Tenant guide");
         assert_eq!(cfg.portal_of("selfcare.home", "/selfcare"), "tenant");
         assert_eq!(cfg.portal_of("x", "/selfcare/bills"), "tenant");
-        assert_eq!(cfg.portal_of("contractor.home", "/contractor"), "other");
+        assert_eq!(cfg.portal_of("contractor.home", "/contractor"), "public");
         assert_eq!(cfg.portal_user("tenant").as_deref(), Some("tenant"));
         let (url, steps) = cfg.login_for("tenant");
         assert_eq!(url, "/selfcare/login");

@@ -21,8 +21,9 @@ fn segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty() && !s.starts_with(':') && !s.starts_with('{')).collect()
 }
 
-fn is_login(path: &str) -> bool {
-    matches!(segments(path).last().copied(), Some("login" | "signin" | "sign-in"))
+fn is_login(path: &str, name: &str) -> bool {
+    let word = |w: Option<&str>| matches!(w, Some("login" | "signin" | "sign-in"));
+    word(segments(path).last().copied()) || (path.is_empty() && word(name.rsplit('.').next()))
 }
 
 fn title_of(name: &str) -> String {
@@ -38,7 +39,7 @@ pub fn detect(screens: &[Screen]) -> Vec<Portal> {
         }
     };
     for s in screens {
-        if is_login(&s.path) {
+        if is_login(&s.path, &s.name) {
             let segs = segments(&s.path);
             let name = segs[..segs.len() - 1].iter().rev().find(|x| !GENERIC.contains(x)).copied().unwrap_or("app");
             add(name, s.path.clone());
@@ -61,6 +62,14 @@ pub fn detect(screens: &[Screen]) -> Vec<Portal> {
         }
     }
     out
+}
+
+/// The portal of a page: "" without portals, the first portal whose patterns match, else "public".
+pub fn portal_in(portals: &[Portal], key: &str, path: &str) -> String {
+    if portals.is_empty() {
+        return String::new();
+    }
+    portals.iter().find(|p| crate::work::page_matches(key, path, &p.pages)).map(|p| p.name.clone()).unwrap_or_else(|| "public".into())
 }
 
 /// `[guide.portals.<name>]` blocks for .doctest.toml.

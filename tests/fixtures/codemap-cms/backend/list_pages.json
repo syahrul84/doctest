@@ -1,0 +1,3 @@
+{"data":{"found":true,"pages":[
+ {"path":"/admin/ad-orders","name":"filament.admin.resources.ad-orders.index","file":"app/Filament/Resources/AdOrderResource/Pages/ListAdOrders.php","source":"filament","defined_in":"app/Filament/Resources/AdOrderResource.php:9","meta":"resource AdOrderResource · model AdOrder · table table(): id, banner_type, starts_on, member.name, amount"}
+]},"meta":{}}

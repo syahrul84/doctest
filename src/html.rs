@@ -251,7 +251,7 @@ fn portal_of_path(cfg: &Config, path: &Path) -> String {
         .nth(2)
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .unwrap_or_default();
-    let known = cfg.guide.portals.iter().any(|p| crate::source::slug(&p.name) == third) || third == "other";
+    let known = cfg.guide.portals.iter().any(|p| crate::source::slug(&p.name) == third) || third == "other" || third == "public";
     if known && path.components().count() > 4 {
         third
     } else {

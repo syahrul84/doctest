@@ -24,9 +24,12 @@ pub struct Page {
     /// Relative to the app.
     pub component: PathBuf,
     pub module: String,
-    /// The guide (audience) it belongs to; "" without portals.
+    /// The guide (audience) it belongs to; "" without portals, "public" outside every portal.
     #[serde(default)]
     pub portal: String,
+    /// vue (also Vue 2 / Nuxt router pages), filament, blade; "" = vue.
+    #[serde(default)]
+    pub stack: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -84,6 +87,10 @@ pub struct FactBuilder<'a> {
     routes: Option<HashMap<(String, String), Value>>,
     /// Any codemap answer was stale.
     pub stale: bool,
+    /// The portals in use: from .doctest.toml, else detected from the login pages (filled by `pages`).
+    pub portals: Vec<crate::config::Portal>,
+    /// Filament page key → (codemap meta, resource file).
+    filament: HashMap<String, (String, String)>,
 }
 
 impl<'a> FactBuilder<'a> {
@@ -105,6 +112,8 @@ impl<'a> FactBuilder<'a> {
             components: HashMap::new(),
             routes: None,
             stale: false,
+            portals: cfg.guide.portals.clone(),
+            filament: HashMap::new(),
         }
     }
 
@@ -126,51 +135,89 @@ impl<'a> FactBuilder<'a> {
         Ok(a.data)
     }
 
+    /// Every screen of every app: Vue / Nuxt router pages of the frontends, Filament pages and Blade pages (web
+    /// routes that render a view) of the backend. Also settles the portals and each page's portal.
     pub fn pages(&mut self) -> Result<Vec<Page>, String> {
-        let mut out: Vec<Page> = Vec::new();
+        let mut all: Vec<Page> = Vec::new();
+        let push = |all: &mut Vec<Page>, p: Page| {
+            if !all.iter().any(|o| o.key == p.key) {
+                all.push(p);
+            }
+        };
         for fe in self.cfg.frontends.clone() {
             let app = Config::repo_name(&fe);
             let (items, stale) = self.api.paged(&app, "list_pages", json!({"detail": "full"}), "pages")?;
             self.stale |= stale;
             for p in items {
                 let Some(file) = p["file"].as_str() else { continue };
-                if p["redirect"].as_str().is_some_and(|r| !r.is_empty()) {
-                    continue;
-                }
-                if !fe.join(file).is_file() {
+                if p["redirect"].as_str().is_some_and(|r| !r.is_empty()) || !fe.join(file).is_file() {
                     continue;
                 }
                 let path = p["path"].as_str().unwrap_or_default().to_string();
                 let route_name = p["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
                 let key = route_name.clone().unwrap_or_else(|| path.clone());
-                if out.iter().any(|o| o.key == key) {
-                    continue;
-                }
-                let g = &self.cfg.guide;
-                if (!g.include.is_empty() && !crate::work::page_matches(&key, &path, &g.include))
-                    || crate::work::page_matches(&key, &path, &g.exclude)
-                {
-                    continue;
-                }
-                let module = module_for(&self.menu, route_name.as_deref().unwrap_or_default(), &path)
-                    .unwrap_or_else(|| module_from_path(&path));
-                let portal = self.cfg.portal_of(&key, &path);
-                out.push(Page {
-                    key,
-                    app: app.clone(),
-                    path,
-                    route_name,
-                    component: PathBuf::from(file),
-                    module,
-                    portal,
-                });
+                let module = module_for(&self.menu, route_name.as_deref().unwrap_or_default(), &path).unwrap_or_else(|| module_from_path(&path));
+                let stack = if p["source"] == "nuxt" { "nuxt" } else { "vue" };
+                push(&mut all, Page { key, app: app.clone(), path, route_name, component: PathBuf::from(file), module, portal: String::new(), stack: stack.into() });
             }
         }
+        // the backend's own screens: Filament pages
+        let (items, stale) = self.api.paged(BACKEND, "list_pages", json!({"detail": "full"}), "pages")?;
+        self.stale |= stale;
+        for p in items.iter().filter(|p| p["source"] == "filament") {
+            let Some(file) = p["file"].as_str() else { continue };
+            let path = p["path"].as_str().unwrap_or_default().to_string();
+            let name = p["name"].as_str().unwrap_or_default().to_string();
+            // filament.<panel>.resources.<resource>.<page>
+            let parts: Vec<&str> = name.split('.').collect();
+            let module = parts.iter().position(|x| *x == "resources" || *x == "pages").and_then(|i| parts.get(i + 1)).map(|s| s.to_string()).unwrap_or_else(|| module_from_path(&path));
+            let resource_file = p["defined_in"].as_str().and_then(|d| d.rsplit_once(':').map(|(f, _)| f.to_string()).or(Some(d.to_string()))).unwrap_or_default();
+            self.filament.insert(name.clone(), (p["meta"].as_str().unwrap_or_default().to_string(), resource_file));
+            push(&mut all, Page { key: name.clone(), app: BACKEND.into(), path, route_name: Some(name), component: PathBuf::from(file), module, portal: String::new(), stack: "filament".into() });
+        }
+        // Blade pages: GET web routes whose action renders a view
+        let routes: Vec<Value> = self.all_routes()?.values().cloned().collect();
+        let mut routes = routes;
+        routes.sort_by(|a, b| a["uri"].as_str().cmp(&b["uri"].as_str()));
+        for r in routes {
+            let uri = r["uri"].as_str().unwrap_or_default();
+            if !r["methods"].as_str().unwrap_or_default().split('|').any(|m| m == "GET") || uri.starts_with("api/") || uri == "api" {
+                continue;
+            }
+            let Some(view) = view_of(&r) else { continue };
+            let file = format!("resources/views/{}.blade.php", view.replace('.', "/"));
+            if !self.cfg.backend.join(&file).is_file() {
+                continue;
+            }
+            let path = format!("/{}", uri.trim_start_matches('/'));
+            let route_name = r["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
+            let key = route_name.clone().unwrap_or_else(|| path.clone());
+            let module = module_from_path(&path);
+            push(&mut all, Page { key, app: BACKEND.into(), path, route_name, component: PathBuf::from(file), module, portal: String::new(), stack: "blade".into() });
+        }
+        if self.portals.is_empty() {
+            let screens: Vec<crate::portals::Screen> = all.iter().map(|p| crate::portals::Screen { path: p.path.clone(), name: p.key.clone(), stack: p.stack.clone() }).collect();
+            self.portals = crate::portals::detect(&screens);
+        }
+        let g = &self.cfg.guide;
+        let mut out: Vec<Page> = all
+            .into_iter()
+            .filter(|p| (g.include.is_empty() || crate::work::page_matches(&p.key, &p.path, &g.include)) && !crate::work::page_matches(&p.key, &p.path, &g.exclude))
+            .map(|mut p| {
+                p.portal = crate::portals::portal_in(&self.portals, &p.key, &p.path);
+                p
+            })
+            .collect();
         out.sort_by(|a, b| (&a.module, &a.key).cmp(&(&b.module, &b.key)));
         Ok(out)
     }
 
     pub fn facts(&mut self, page: &Page) -> Result<PageFacts, String> {
+        match page.stack.as_str() {
+            "filament" => return Ok(self.filament_facts(page)),
+            "blade" => return self.blade_facts(page),
+            _ => {}
+        }
         let dir = self.app_dir(&page.app);
         let mut labels: BTreeMap<String, BTreeSet<String>> = self
             .cfg
@@ -386,6 +433,96 @@ impl<'a> FactBuilder<'a> {
             self.routes = Some(map);
         }
         Ok(self.routes.as_ref().expect("loaded"))
+    }
+
+    fn empty_labels(&self) -> BTreeMap<String, Vec<String>> {
+        self.cfg.languages.iter().map(|l| (l.clone(), Vec::new())).collect()
+    }
+
+    /// A Filament page: its table columns and form fields (as Filament shows them) and the labels in its resource.
+    fn filament_facts(&mut self, page: &Page) -> PageFacts {
+        let (meta, resource) = self.filament.get(&page.key).cloned().unwrap_or_default();
+        let mut literals: BTreeSet<String> = BTreeSet::new();
+        for part in meta.split(" · ") {
+            if let Some((_, fields)) = part.split_once("(): ") {
+                for f in fields.split(',').map(str::trim).filter(|f| !f.is_empty() && *f != "id") {
+                    literals.insert(headline(f));
+                }
+            }
+        }
+        let mut code_files = vec![page.component.to_string_lossy().into_owned()];
+        if !resource.is_empty() {
+            if let Ok(text) = std::fs::read_to_string(self.cfg.backend.join(&resource)) {
+                static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"->(?:label|heading|title|placeholder|helperText)\(\s*'([^']+)'"#).unwrap());
+                static MAKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"::make\(\s*'([\w.]+)'"#).unwrap());
+                literals.extend(LABEL.captures_iter(&text).map(|c| c[1].to_string()));
+                literals.extend(MAKE.captures_iter(&text).map(|c| headline(&c[1])));
+            }
+            code_files.push(resource.clone());
+        }
+        PageFacts {
+            page: page.clone(),
+            labels: self.empty_labels(),
+            literals: literals.into_iter().collect(),
+            components: code_files.clone(),
+            code_files,
+            endpoints: Vec::new(),
+            menu_titles: vec![headline(&page.module)],
+        }
+    }
+
+    /// A Blade page: its text, its translated labels (`__()`, `@lang`, `trans`), the views it includes and the
+    /// routes its forms and links use.
+    fn blade_facts(&mut self, page: &Page) -> Result<PageFacts, String> {
+        static INCLUDE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"@include(?:If|When)?\(\s*(?:[^,]+,\s*)?'([\w.\-/]+)'"#).unwrap());
+        static LANG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:__|trans|trans_choice|@lang)\(\s*['"]([^'"]+)['"]"#).unwrap());
+        static ROUTE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"route\(\s*['"]([\w.\-]+)['"]"#).unwrap());
+        let mut labels: BTreeMap<String, BTreeSet<String>> = self.cfg.languages.iter().map(|l| (l.clone(), BTreeSet::new())).collect();
+        let mut literals = BTreeSet::new();
+        let mut files = vec![page.component.to_string_lossy().into_owned()];
+        let mut route_names = BTreeSet::new();
+        let mut i = 0;
+        while i < files.len() && i < 20 {
+            let text = std::fs::read_to_string(self.cfg.backend.join(&files[i])).unwrap_or_default();
+            literals.extend(template_literals(&text));
+            for c in LANG.captures_iter(&text) {
+                for (lang, set) in labels.iter_mut() {
+                    if let Some(t) = self.labels.text(lang, &c[1]) {
+                        set.insert(t.trim().to_string());
+                    }
+                }
+            }
+            route_names.extend(ROUTE.captures_iter(&text).map(|c| c[1].to_string()));
+            for c in INCLUDE.captures_iter(&text) {
+                let f = format!("resources/views/{}.blade.php", c[1].replace('.', "/"));
+                if !files.contains(&f) && self.cfg.backend.join(&f).is_file() {
+                    files.push(f);
+                }
+            }
+            i += 1;
+        }
+        let mut endpoints = Vec::new();
+        let named: Vec<(String, String)> = self
+            .all_routes()?
+            .iter()
+            .filter(|(_, r)| r["name"].as_str().is_some_and(|n| route_names.contains(n)))
+            .map(|((m, u), _)| (m.clone(), u.clone()))
+            .filter(|(m, _)| m != "GET" && m != "HEAD")
+            .collect();
+        for (m, u) in named {
+            if let Some(e) = self.endpoint(&m, &u)? {
+                endpoints.push(e);
+            }
+        }
+        Ok(PageFacts {
+            page: page.clone(),
+            labels: labels.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect(),
+            literals: literals.into_iter().collect(),
+            components: files.clone(),
+            code_files: files,
+            endpoints,
+            menu_titles: Vec::new(),
+        })
     }
 
     /// The backend route `METHOD uri` with its permissions, rules and messages (cached).
@@ -623,6 +760,37 @@ pub fn screenshot_plan(actions: &[Action]) -> Vec<String> {
         }
     }
     out
+}
+
+/// `member.name` / `banner_type` → `Member name` / `Banner type` (how Filament and most UIs label a field).
+pub fn headline(field: &str) -> String {
+    let words: Vec<String> = field
+        .split(['.', '_', '-'])
+        .filter(|w| !w.is_empty())
+        .flat_map(|w| {
+            // camelCase → camel case
+            let mut parts = vec![String::new()];
+            for ch in w.chars() {
+                if ch.is_uppercase() && !parts.last().is_some_and(|p| p.is_empty()) {
+                    parts.push(String::new());
+                }
+                parts.last_mut().expect("one part").push(ch.to_ascii_lowercase());
+            }
+            parts
+        })
+        .collect();
+    let s = words.join(" ");
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+/// The Blade view a route renders: its `view` field, or `view('name'` in what codemap says it returns.
+fn view_of(route: &Value) -> Option<String> {
+    if let Some(v) = route["view"].as_str().filter(|v| !v.is_empty()) {
+        return Some(v.to_string());
+    }
+    static VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"view\(\s*['"]([\w.\-/:]+)['"]"#).unwrap());
+    VIEW.captures(route["returns"].as_str().unwrap_or_default()).map(|c| c[1].to_string())
 }
 
 /// An endpoint from a `list_routes` (detail full) entry, without rules and messages.
@@ -1145,6 +1313,52 @@ pub(crate) mod tests {
         assert_eq!(f.page.module, "orders");
     }
 
+    fn cms() -> (tempfile::TempDir, Config, FixtureCodemap, Labels) {
+        let d = tempfile::tempdir().unwrap();
+        let cms = fixtures().join("cms");
+        std::fs::write(d.path().join(".doctest.toml"), format!("[project]\nname=\"cms\"\nbackend=\"{}\"\n", cms.display())).unwrap();
+        let cfg = Config::find(d.path()).unwrap();
+        let labels = Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+        (d, cfg, FixtureCodemap::new(fixtures().join("codemap-cms")), labels)
+    }
+
+    #[test]
+    fn filament_and_blade_screens_are_pages() {
+        let (_d, cfg, mut api, labels) = cms();
+        let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
+        let pages = fb.pages().unwrap();
+        let by = |k: &str| pages.iter().find(|p| p.key == k).unwrap_or_else(|| panic!("{k} not in {:?}", pages.iter().map(|p| &p.key).collect::<Vec<_>>()));
+        let f = by("filament.admin.resources.ad-orders.index");
+        assert_eq!((f.stack.as_str(), f.module.as_str(), f.portal.as_str()), ("filament", "ad-orders", "admin"));
+        let b = by("portal.dashboard");
+        assert_eq!((b.stack.as_str(), b.path.as_str(), b.portal.as_str()), ("blade", "/portal/dashboard", "portal"));
+        assert_eq!(b.component, PathBuf::from("resources/views/portal/dashboard.blade.php"));
+        assert!(!pages.iter().any(|p| p.path.starts_with("/api")), "API routes are not screens");
+        assert_eq!(fb.portals.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), vec!["admin", "portal"]);
+    }
+
+    #[test]
+    fn filament_facts() {
+        let (_d, cfg, mut api, labels) = cms();
+        let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
+        let page = fb.pages().unwrap().into_iter().find(|p| p.stack == "filament").unwrap();
+        let f = fb.facts(&page).unwrap();
+        for want in ["Banner type", "Starts on date", "Amount", "Member name"] {
+            assert!(f.labels["en"].iter().chain(&f.literals).any(|l| l == want), "{want} not in {:?} / {:?}", f.labels, f.literals);
+        }
+    }
+
+    #[test]
+    fn blade_facts() {
+        let (_d, cfg, mut api, labels) = cms();
+        let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
+        let page = fb.pages().unwrap().into_iter().find(|p| p.key == "portal.dashboard").unwrap();
+        let f = fb.facts(&page).unwrap();
+        assert!(f.literals.contains(&"Welcome back".to_string()) && f.literals.contains(&"Save profile".to_string()), "{:?}", f.literals);
+        assert!(f.labels["en"].contains(&"Dashboard".to_string()) && f.labels["en"].contains(&"Phone number".to_string()), "{:?}", f.labels);
+        assert!(f.endpoints.iter().any(|e| e.method == "POST" && e.uri == "portal/profile"), "{:?}", f.endpoints);
+    }
+
     #[test]
     fn facts_resolve_labels_and_literals() {
         let (_d, cfg, mut api, labels) = setup();
@@ -1283,6 +1497,7 @@ pub(crate) mod tests {
                 component: "a.vue".into(),
                 module: "m".into(),
                 portal: String::new(),
+                stack: String::new(),
             },
             labels: BTreeMap::from([("en".to_string(), vec!["B".to_string(), "A".to_string()])]),
             literals: vec!["Save".into()],
