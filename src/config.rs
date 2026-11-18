@@ -52,7 +52,10 @@ pub struct Portal {
     pub name: String,
     pub title: String,
     pub pages: Vec<String>,
+    /// Only for unattended runs: the [app.users] entry whose env vars sign in.
     pub user: Option<String>,
+    /// The portal's sign-in page; none for a public area.
+    pub login_url: Option<String>,
 }
 
 /// One browser action. Written in TOML as `{ fill = "sel", value = "x" }`, `{ click = "sel" }` …
@@ -195,6 +198,7 @@ struct RawPortal {
     #[serde(default)]
     pages: Vec<String>,
     user: Option<String>,
+    login_url: Option<String>,
 }
 
 impl Config {
@@ -239,6 +243,7 @@ impl Config {
                 title,
                 pages: rp.pages,
                 user: rp.user,
+                login_url: rp.login_url,
             });
         }
         let run = raw.tests.run.unwrap_or_else(|| "php artisan test {filter}".into());

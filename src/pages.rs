@@ -1084,6 +1084,7 @@ pub(crate) mod tests {
             title: "Shop guide".into(),
             pages: vec!["shop.*".into()],
             user: None,
+            login_url: None,
         }];
         let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
         assert_eq!(fb.pages().unwrap()[0].portal, "shop");

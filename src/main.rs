@@ -14,6 +14,7 @@ mod issues;
 mod ledger;
 mod mcp;
 mod pages;
+mod portals;
 mod progress;
 mod reports;
 mod server;
