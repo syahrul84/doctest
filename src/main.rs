@@ -118,11 +118,19 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sign in to the app once in a Chrome window doctest opens (OTP is fine); screenshots reuse that session
+    /// Sign in once per portal (admin, selfcare …) in a Chrome window doctest opens (OTP is fine); screenshots
+    /// reuse each portal's session. Without a portal name: every portal not signed in yet, one after another
     Login {
-        /// The [app.users] name (or portal user) to sign in as; default: the first, else "default"
+        /// The portal to sign in to (default: every one not signed in yet)
+        portal: Option<String>,
+        /// Same as the portal name (older spelling)
         #[arg(long)]
         user: Option<String>,
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
+    /// The portals doctest finds (from the login pages), their sign-in page, screens and sign-in state
+    Portals {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
@@ -331,16 +339,134 @@ fn main() -> ExitCode {
             };
             setup::run(&opts, &setup::claude_cli).map(|t| (t, true))
         })(),
-        Command::Login { user, project } => (|| {
+        Command::Login { portal, user, project } => (|| {
             let cfg = load(&project)?;
-            let user = user.unwrap_or_else(|| shots::default_user(&cfg));
-            let (login_url, _) = cfg.login_for(&user);
-            eprintln!(
-                "Opening Chrome on {}{login_url} — sign in as {user}; the window closes by itself once you are in.",
-                cfg.app.base_url
+            // portals from .doctest.toml, else detected from the app's login pages
+            let eff = if cfg.guide.portals.is_empty() {
+                let labels = i18n::Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+                let mut api = codemap::LiveCodemap::new(&cfg);
+                let mut fb = pages::FactBuilder::new(&mut api, &cfg, &labels);
+                fb.pages()?;
+                cfg.with_portals(fb.portals.clone())
+            } else {
+                cfg.clone()
+            };
+            let targets = eff.login_targets();
+            if targets.is_empty() {
+                return Ok((
+                    "this app has no sign-in page: screenshots open its pages directly".into(),
+                    true,
+                ));
+            }
+            let wanted = portal.or(user);
+            let todo: Vec<(String, String)> = match &wanted {
+                Some(w) => vec![targets.iter().find(|(n, _)| n == w).cloned().ok_or_else(|| {
+                    format!(
+                        "unknown portal {w}; portals with a sign-in page: {}",
+                        targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                })?],
+                None => targets
+                    .iter()
+                    .filter(|(n, _)| !shots::signed_in(&eff, n))
+                    .cloned()
+                    .collect(),
+            };
+            if todo.is_empty() {
+                return Ok((
+                    format!(
+                        "already signed in to every portal: {}",
+                        targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                    true,
+                ));
+            }
+            let mut done = Vec::new();
+            for (k, (name, url)) in todo.iter().enumerate() {
+                eprintln!(
+                    "[{}/{}] Sign in to the {name} portal: a Chrome window opens on {}{url}; it closes by itself once you are in.",
+                    k + 1,
+                    todo.len(),
+                    eff.app.base_url
+                );
+                done.push(shots::login(&eff, name, false, &|_| {})?);
+            }
+            Ok((
+                format!(
+                    "signed in to: {}; screenshots of each portal's pages reuse its session (run `doctest login` again when one expires)",
+                    done.join(", ")
+                ),
+                true,
+            ))
+        })(),
+        Command::Portals { project } => (|| {
+            let cfg = load(&project)?;
+            let labels = i18n::Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+            let mut api = codemap::LiveCodemap::new(&cfg);
+            let mut fb = pages::FactBuilder::new(&mut api, &cfg, &labels);
+            let pages = fb.pages()?;
+            let eff = cfg.with_portals(fb.portals.clone());
+            let source = if cfg.guide.portals.is_empty() {
+                "detected from the login pages"
+            } else {
+                "from .doctest.toml"
+            };
+            let mut out = format!("{} screens; portals {source}:\n", pages.len());
+            let mut stacks: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for p in &pages {
+                *stacks
+                    .entry(if p.stack.is_empty() { "vue" } else { p.stack.as_str() })
+                    .or_default() += 1;
+            }
+            for p in &eff.guide.portals {
+                let n = pages.iter().filter(|x| x.portal == p.name).count();
+                let login = eff.login_for(&p.name).0;
+                out += &format!(
+                    "  {:<12} {:>4} screens  sign-in {:<28} {}\n",
+                    p.name,
+                    n,
+                    if login.is_empty() { "none".to_string() } else { login },
+                    if shots::signed_in(&eff, &p.name) {
+                        "signed in"
+                    } else {
+                        "not signed in (doctest login)"
+                    }
+                );
+            }
+            let public = pages
+                .iter()
+                .filter(|x| x.portal == "public" || x.portal.is_empty())
+                .count();
+            out += &format!(
+                "  {:<12} {:>4} screens  no sign-in\n",
+                if eff.guide.portals.is_empty() {
+                    "(all)"
+                } else {
+                    "public"
+                },
+                public
             );
-            shots::login(&cfg, &user, false, &|_| {})
-                .map(|u| (format!("signed in as {u}; screenshots will reuse this session (run `doctest login` again when it expires)"), true))
+            let names: Vec<&str> = pages
+                .iter()
+                .filter(|x| x.portal == "public")
+                .map(|x| x.path.as_str())
+                .collect();
+            if !names.is_empty() {
+                out += &format!(
+                    "    public: {}{}\n",
+                    names.iter().take(12).cloned().collect::<Vec<_>>().join(", "),
+                    if names.len() > 12 { ", …" } else { "" }
+                );
+            }
+            out += &format!(
+                "screens by kind: {}",
+                stacks
+                    .iter()
+                    .map(|(k, v)| format!("{v} {k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Ok((out, true))
         })(),
         Command::Doctor { project } => {
             let start = std::fs::canonicalize(&project).unwrap_or(project);

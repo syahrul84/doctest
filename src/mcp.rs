@@ -19,7 +19,7 @@ use crate::state::{CoverSource, RunRecord, State};
 use crate::testwrite::{self, NewTests};
 use crate::work::{self, Scope};
 
-pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: each portal (admin, tenant, vendor…) has its own guide; facts gives the page's source_path inside its portal, and screenshots sign in as the portal's user. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
+pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
 pub type Factory = std::sync::Arc<dyn Fn(&Config, usize) -> Box<dyn CodemapApi + Send> + Send + Sync>;
@@ -28,6 +28,23 @@ struct Project {
     cfg: Config,
     api: Box<dyn CodemapApi + Send>,
     shooter: Option<Shooter>,
+    /// Portals detected from the login pages (when .doctest.toml names none), once per session.
+    portals: Option<Vec<crate::config::Portal>>,
+}
+
+/// The project's config with its portals: from .doctest.toml, else detected (and cached).
+fn effective_cfg(p: &mut Project) -> Result<Config, String> {
+    if !p.cfg.guide.portals.is_empty() {
+        return Ok(p.cfg.clone());
+    }
+    if p.portals.is_none() {
+        let cfg = p.cfg.clone();
+        let labels = Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+        let mut fb = FactBuilder::new(&mut *p.api, &cfg, &labels);
+        fb.pages()?;
+        p.portals = Some(fb.portals.clone());
+    }
+    Ok(p.cfg.with_portals(p.portals.clone().unwrap_or_default()))
 }
 
 pub struct Server {
@@ -152,7 +169,7 @@ pub fn tools() -> Value {
         tool(
             "login",
             "Open a Chrome window on the app's sign-in page for the person to sign in by hand (OTP is fine); screenshots then reuse that session. Call it when shoot says it is not signed in or the session expired, and tell the person a window is opening.",
-            json!({"user": {"type": "string", "description": "the [app.users] or portal user; default the first, else default"}}),
+            json!({"portal": {"type": "string", "description": "the portal to sign in to (admin, selfcare …); default: the next one not signed in"}}),
             &[]
         ),
     ])
@@ -214,6 +231,7 @@ impl Server {
                     cfg,
                     api,
                     shooter: None,
+                    portals: None,
                 },
             );
         } else {
@@ -435,18 +453,50 @@ impl Server {
                 ))
             }
             "login" => {
-                let user = s(args, "user")
-                    .map(String::from)
-                    .unwrap_or_else(|| crate::shots::default_user(&p.cfg));
+                let eff = effective_cfg(p)?;
+                let targets = eff.login_targets();
+                if targets.is_empty() {
+                    return text("this app has no sign-in page: screenshots open its pages directly".into());
+                }
+                let wanted = s(args, "portal").or_else(|| s(args, "user"));
+                let name = match wanted {
+                    Some(w) => targets
+                        .iter()
+                        .find(|(n, _)| n == w)
+                        .map(|(n, _)| n.clone())
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown portal {w}; portals with a sign-in page: {}",
+                                targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
+                            )
+                        })?,
+                    None => targets
+                        .iter()
+                        .find(|(n, _)| !crate::shots::signed_in(&eff, n))
+                        .map(|(n, _)| n.clone())
+                        .ok_or("already signed in to every portal")?,
+                };
                 progress.step(
                     0,
                     1,
-                    &format!("waiting for the person to sign in as {user} in the Chrome window"),
+                    &format!("waiting for the person to sign in to the {name} portal in the Chrome window"),
                 );
-                let u = crate::shots::login(&p.cfg, &user, false, &|_| {})?;
+                let u = crate::shots::login(&eff, &name, false, &|_| {})?;
                 p.shooter = None; // the next shoot starts from the new session
                 progress.step(1, 1, "signed in");
-                text(format!("signed in as {u}; screenshots reuse this session"))
+                let left: Vec<String> = targets
+                    .iter()
+                    .filter(|(n, _)| !crate::shots::signed_in(&eff, n))
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                text(format!(
+                    "signed in to the {u} portal; screenshots of its pages reuse this session{}",
+                    if left.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Still to sign in: {}", left.join(", "))
+                    }
+                ))
             }
             "issues" => {
                 let mut points = Vec::new();
@@ -545,10 +595,12 @@ impl Server {
 }
 
 /// The user a screenshot signs in as: its own, else its portal's, else the first configured user.
+/// The session a screenshot uses: its own, else its page's portal (public pages sign in nowhere), else the default.
 fn shot_user(cfg: &Config, spec: &ShotSpec) -> Option<String> {
-    spec.user
-        .clone()
-        .or_else(|| cfg.portal_user(&cfg.portal_of(&spec.page, &spec.path)))
+    spec.user.clone().or_else(|| {
+        let portal = cfg.portal_of(&spec.page, &spec.path);
+        (!portal.is_empty()).then_some(portal)
+    })
 }
 
 fn report_kind(error: &str) -> &'static str {
@@ -1393,12 +1445,13 @@ fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
         _ => return Err("send spec or id".into()),
     };
     let mut spec = spec;
-    spec.user = shot_user(&p.cfg, &spec);
+    let eff = effective_cfg(p)?;
+    spec.user = shot_user(&eff, &spec);
     crate::shots::validate_spec(&spec)?;
     crate::shots::resolve_path(&spec)?;
     check_lang(&p.cfg, &spec.lang)?;
     if p.shooter.is_none() {
-        p.shooter = Some(Shooter::start(&p.cfg)?);
+        p.shooter = Some(Shooter::start(&eff)?);
     }
     let path = p.shooter.as_mut().expect("started").capture(&spec)?;
     State::update(&p.cfg, |st| {
@@ -2085,7 +2138,11 @@ mod tests {
             lang: "en".into(),
             ..ShotSpec::default()
         };
-        assert_eq!(shot_user(&cfg, &spec).as_deref(), Some("buyer"));
+        assert_eq!(
+            shot_user(&cfg, &spec).as_deref(),
+            Some("shop"),
+            "screenshots use their portal's session"
+        );
         let mut own = spec.clone();
         own.user = Some("admin".into());
         assert_eq!(shot_user(&cfg, &own).as_deref(), Some("admin"));

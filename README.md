@@ -86,30 +86,43 @@ require_actions = true                # a section per action (Add, Edit, Delete,
 
 publish_path = "/docs"                # where the server publishes document/guide
 
-[guide.portals.admin]                 # one guide per portal; pages matching no portal go to "other"
+# Portals: written by `doctest init` from the app's login pages; pages matching no portal are public.
+[guide.portals.admin]
 title = "Admin guide"
-pages = ["admin.*"]
-user = "admin"                        # screenshots sign in as this [app.users] entry
-[guide.portals.tenant]
-title = "Tenant guide"
+pages = ["admin.*", "/admin/*"]
+login_url = "/session/admin/login"
+[guide.portals.selfcare]
+title = "Selfcare guide"
 pages = ["selfcare.*", "/selfcare/*"]
-user = "tenant"
+login_url = "/session/selfcare/login"
 
 [work]
 workers = 4                           # AI workers claiming items, tool calls at the same time
 # parallel_reads = true               # also read pages with several codemap clients (off: slower on big apps)
 ```
 
-## Signing in for screenshots
+## Portals and signing in
+
+doctest reads every screen of the app, whatever it is built with: Vue 2 / Vue 3 / Nuxt pages (a separate repo or
+inside the Laravel repo), Filament pages and Blade pages. It finds the **portals** — the app's sign-in areas — from
+its login pages: `/session/admin/login` and `/session/selfcare/login` make an *admin* and a *selfcare* portal, a
+Filament panel at `/admin` makes *admin*, `/portal/login` makes *portal*, a single `/login` makes one portal for the
+whole app, and an app with no login page has none. Each screen belongs to the portal named in its URL or route name;
+screens outside every portal are public. Each portal gets its own guide.
 
 ```bash
-doctest login                 # a Chrome window opens on the sign-in page; sign in by hand (OTP is fine)
-doctest login --user tenant   # another portal's user
+doctest portals               # what doctest found: portals, their sign-in page, screens, signed in or not
+doctest login                 # signs in to every portal not signed in yet, one Chrome window each (OTP is fine)
+doctest login selfcare        # just one portal
 ```
 
-doctest keeps that session in its own Chrome profile (under `~/.doctest/chrome/`, separate from your browser) and
-every screenshot reuses it. No password is stored. When the session expires, doctest says so; run `doctest login`
-again (or let the AI call the `login` tool, which opens the same window).
+doctest keeps each portal's session in its own Chrome profile (under `~/.doctest/chrome/`, separate from your
+browser); screenshots of a page reuse its portal's session, public pages need none. No password is stored. When a
+session expires doctest says so; run `doctest login` again (or the AI calls the `login` tool, which opens the same
+window). `doctest init` writes the portals it found into `.doctest.toml`, so you can rename them or move pages.
+
+Examples: an app with admin, selfcare and contractor logins gets three portals; a Laravel site with a Filament
+admin and a Blade member area gets two, plus its public pages.
 
 ## Use
 

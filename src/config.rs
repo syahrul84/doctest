@@ -323,24 +323,63 @@ impl Config {
         crate::portals::portal_in(&self.guide.portals, key, path)
     }
 
-    /// The user a portal's screenshots sign in as.
-    pub fn portal_user(&self, portal: &str) -> Option<String> {
-        self.guide
-            .portals
-            .iter()
-            .find(|p| p.name == portal)
-            .and_then(|p| p.user.clone())
-    }
-
-    /// Sign-in page and steps for a user ([app] unless the user overrides them).
-    pub fn login_for(&self, user: &str) -> (String, Vec<Step>) {
-        let u = self.app.users.iter().find(|(n, _)| n == user).map(|(_, c)| c);
+    /// Sign-in page and steps for a portal (or an [app.users] name): the portal's login_url, the user's own, else
+    /// [app]; "public" needs none.
+    pub fn login_for(&self, name: &str) -> (String, Vec<Step>) {
+        if name == "public" {
+            return (String::new(), Vec::new());
+        }
+        let portal = self.guide.portals.iter().find(|p| p.name == name);
+        let user = self.creds_user(name);
+        let u = user
+            .as_deref()
+            .and_then(|n| self.app.users.iter().find(|(x, _)| x == n))
+            .map(|(_, c)| c);
         (
-            u.and_then(|c| c.login_url.clone())
+            portal
+                .and_then(|p| p.login_url.clone())
+                .or_else(|| u.and_then(|c| c.login_url.clone()))
                 .unwrap_or_else(|| self.app.login_url.clone()),
             u.and_then(|c| c.login_steps.clone())
                 .unwrap_or_else(|| self.app.login_steps.clone()),
         )
+    }
+
+    /// The [app.users] entry whose env vars sign in as this portal or user (unattended runs only).
+    pub fn creds_user(&self, name: &str) -> Option<String> {
+        self.guide
+            .portals
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.user.clone())
+            .or_else(|| self.app.users.iter().find(|(n, _)| n == name).map(|(n, _)| n.clone()))
+    }
+
+    /// This config with these portals (detected ones when .doctest.toml names none).
+    pub fn with_portals(&self, portals: Vec<Portal>) -> Config {
+        let mut c = self.clone();
+        if c.guide.portals.is_empty() {
+            c.guide.portals = portals;
+        }
+        c
+    }
+
+    /// Every sign-in `doctest login` can do: (portal, login page) for each portal with one, else ("default",
+    /// [app] login_url) when there are no portals.
+    pub fn login_targets(&self) -> Vec<(String, String)> {
+        if self.guide.portals.is_empty() {
+            return if self.app.login_url.is_empty() {
+                Vec::new()
+            } else {
+                vec![("default".into(), self.app.login_url.clone())]
+            };
+        }
+        self.guide
+            .portals
+            .iter()
+            .map(|p| (p.name.clone(), self.login_for(&p.name).0))
+            .filter(|(_, url)| !url.is_empty())
+            .collect()
     }
 
     pub fn primary_language(&self) -> &str {
@@ -470,11 +509,50 @@ allow_bold = ["Note"]
         assert_eq!(cfg.portal_of("selfcare.home", "/selfcare"), "tenant");
         assert_eq!(cfg.portal_of("x", "/selfcare/bills"), "tenant");
         assert_eq!(cfg.portal_of("contractor.home", "/contractor"), "public");
-        assert_eq!(cfg.portal_user("tenant").as_deref(), Some("tenant"));
+        assert_eq!(cfg.creds_user("tenant").as_deref(), Some("tenant"));
         let (url, steps) = cfg.login_for("tenant");
         assert_eq!(url, "/selfcare/login");
         assert_eq!(steps.len(), 1);
         assert_eq!(cfg.login_for("admin").0, "/admin/login");
+    }
+
+    #[test]
+    fn sign_in_per_portal() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&write(
+            d.path(),
+            "[project]\nname=\"x\"\n[app]\nbase_url=\"http://x\"\nlogin_url=\"/login\"\n",
+        ))
+        .unwrap();
+        let p = |name: &str, login: Option<&str>| Portal {
+            name: name.into(),
+            title: format!("{name} guide"),
+            pages: vec![format!("{name}.*")],
+            user: None,
+            login_url: login.map(String::from),
+        };
+        let cfg = cfg.with_portals(vec![
+            p("admin", Some("/session/admin/login")),
+            p("selfcare", Some("/session/selfcare/login")),
+            p("kiosk", None),
+        ]);
+        assert_eq!(cfg.login_for("selfcare").0, "/session/selfcare/login");
+        assert_eq!(
+            cfg.login_for("kiosk").0,
+            "/login",
+            "a portal without its own login page uses [app] login_url"
+        );
+        assert_eq!(cfg.login_for("public").0, "", "public pages need no sign-in");
+        let targets: Vec<(String, String)> = cfg.login_targets();
+        assert_eq!(targets[0], ("admin".to_string(), "/session/admin/login".to_string()));
+        assert_eq!(targets.len(), 3);
+        let flat = Config::load(&write(d.path(), "[project]\nname=\"x\"\n[app]\nlogin_url=\"/login\"\n")).unwrap();
+        assert_eq!(
+            flat.login_targets(),
+            vec![("default".to_string(), "/login".to_string())]
+        );
+        let none = Config::load(&write(d.path(), "[project]\nname=\"x\"\n")).unwrap();
+        assert!(none.login_targets().is_empty());
     }
 
     #[test]

@@ -15,7 +15,7 @@ fn uses_vue(dir: &Path) -> bool {
     let p = json(&dir.join("package.json"));
     ["dependencies", "devDependencies"]
         .iter()
-        .any(|k| p[k].get("vue").is_some())
+        .any(|k| p[k].get("vue").is_some() || p[k].get("nuxt").is_some())
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
@@ -47,7 +47,21 @@ fn is_language_code(stem: &str) -> bool {
         && region.is_none_or(|r| (2..=4).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
+/// `doctest init`, detecting the portals with codemap (from the app's login pages).
 pub fn run(dir: &Path) -> Result<PathBuf, String> {
+    run_with(dir, &|cfg: &crate::config::Config| {
+        let labels = crate::i18n::Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+        let mut api = crate::codemap::LiveCodemap::new(cfg);
+        let mut fb = crate::pages::FactBuilder::new(&mut api, cfg, &labels);
+        fb.pages()?;
+        Ok(fb.portals.clone())
+    })
+}
+
+pub fn run_with(
+    dir: &Path,
+    detect: &dyn Fn(&crate::config::Config) -> Result<Vec<crate::config::Portal>, String>,
+) -> Result<PathBuf, String> {
     let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(crate::config::FILE);
     if path.exists() {
@@ -146,7 +160,21 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
         Some(m) => format!("modules_from = \"{m}\"\n"),
         None => "# modules_from = \"../web/src/config/menu.ts\"   # TODO: menu file with routeName entries, for chapters\n".into(),
     });
-    std::fs::write(&path, t).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    std::fs::write(&path, &t).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    // the portals: detected from the app's login pages, written so the person can rename or move them
+    let extra = match crate::config::Config::load(&path).and_then(|cfg| detect(&cfg)) {
+        Ok(portals) if portals.is_empty() => {
+            "\n# No sign-in pages found: every screen is public (no `doctest login` needed).\n".to_string()
+        }
+        Ok(portals) => format!(
+            "\n# Portals found from the app's login pages: one guide and one `doctest login` each. Rename titles or move pages as you like.\n{}",
+            crate::portals::to_toml(&portals)
+        ),
+        Err(e) => {
+            format!("\n# Portals were not written ({e}); doctest finds them from the login pages when it runs.\n")
+        }
+    };
+    std::fs::write(&path, t + &extra).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -179,7 +207,7 @@ mod tests {
             "{ routeName: 'a' }, { routeName: 'b' }, { routeName: 'c' }",
         )
         .unwrap();
-        let t = std::fs::read_to_string(run(&api).unwrap()).unwrap();
+        let t = std::fs::read_to_string(run_with(&api, &|_| Ok(Vec::new())).unwrap()).unwrap();
         assert!(
             t.contains("name = \"shop-api\""),
             "a generic composer name falls back to the folder: {t}"
@@ -192,6 +220,41 @@ mod tests {
             t.contains("modules_from = \"../shop-web/src/config/adminMenuGroups.ts\""),
             "the file with the most routeName entries: {t}"
         );
+    }
+
+    #[test]
+    fn init_writes_the_detected_portals() {
+        let d = tempfile::tempdir().unwrap();
+        let api = d.path().join("api");
+        let web = d.path().join("web");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(api.join("composer.json"), r#"{"name":"acme/api"}"#).unwrap();
+        std::fs::write(web.join("package.json"), r#"{"dependencies":{"nuxt":"^3.12"}}"#).unwrap();
+        let detect = |_cfg: &crate::config::Config| -> Result<Vec<crate::config::Portal>, String> {
+            Ok(crate::portals::detect(&[
+                crate::portals::Screen {
+                    path: "/session/admin/login".into(),
+                    name: "session.admin.login".into(),
+                    stack: "vue".into(),
+                },
+                crate::portals::Screen {
+                    path: "/session/selfcare/login".into(),
+                    name: "session.selfcare.login".into(),
+                    stack: "vue".into(),
+                },
+            ]))
+        };
+        let path = run_with(&api, &detect).unwrap();
+        let t = std::fs::read_to_string(&path).unwrap();
+        assert!(t.contains("frontends = [\"../web\"]"), "a Nuxt repo is a frontend: {t}");
+        assert!(
+            t.contains("[guide.portals.admin]") && t.contains("login_url = \"/session/selfcare/login\""),
+            "{t}"
+        );
+        let cfg = crate::config::Config::load(&path).unwrap();
+        assert_eq!(cfg.guide.portals.len(), 2);
+        assert_eq!(cfg.login_targets().len(), 2);
     }
 
     #[test]
@@ -215,7 +278,7 @@ mod tests {
             "export const m = { a: [{ label: 'X', routeName: 'x' }] }",
         )
         .unwrap();
-        let path = run(&api).unwrap();
+        let path = run_with(&api, &|_| Ok(Vec::new())).unwrap();
         let t = std::fs::read_to_string(&path).unwrap();
         assert!(t.contains("name = \"shop-api\""), "{t}");
         assert!(t.contains("frontends = [\"../web\"]"), "{t}");
@@ -223,6 +286,10 @@ mod tests {
         assert!(t.contains("modules_from = \"../web/src/config/adminMenu.ts\""), "{t}");
         assert!(t.contains("# TODO"), "{t}");
         crate::config::Config::load(&path).unwrap();
-        assert!(run(&api).unwrap_err().contains("already exists"));
+        assert!(
+            run_with(&api, &|_| Ok(Vec::new()))
+                .unwrap_err()
+                .contains("already exists")
+        );
     }
 }

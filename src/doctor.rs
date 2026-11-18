@@ -190,54 +190,33 @@ pub fn run(cfg: Option<&Config>, start: &Path) -> Vec<Check> {
             )
         });
     }
-    // every user screenshots sign in as: [app.users], portal users, else "default"
-    let mut users: Vec<String> = cfg.app.users.iter().map(|(n, _)| n.clone()).collect();
-    for p in &cfg.guide.portals {
-        if let Some(u) = &p.user
-            && !users.contains(u)
-        {
-            users.push(u.clone());
-        }
-    }
-    if users.is_empty() {
-        users.push(crate::shots::default_user(cfg));
-    }
-    let missing: Vec<String> =
-        users
-            .iter()
-            .filter(|u| {
-                let by_env =
-                    cfg.app.users.iter().find(|(n, _)| n == *u).is_some_and(|(_, c)| {
-                        std::env::var(&c.user_env).is_ok() && std::env::var(&c.password_env).is_ok()
-                    });
-                !crate::shots::signed_in(cfg, u) && !by_env
-            })
-            .cloned()
-            .collect();
-    out.push(if cfg.app.login_url.is_empty() && cfg.app.users.is_empty() {
+    // sign-in for screenshots: one per portal (or one for the app)
+    let targets = cfg.login_targets();
+    let unattended = |name: &str| {
+        cfg.creds_user(name)
+            .and_then(|u| cfg.app.users.iter().find(|(n, _)| *n == u).map(|(_, c)| c.clone()))
+            .is_some_and(|c| std::env::var(&c.user_env).is_ok() && std::env::var(&c.password_env).is_ok())
+    };
+    let missing: Vec<String> = targets
+        .iter()
+        .filter(|(n, _)| !crate::shots::signed_in(cfg, n) && !unattended(n))
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.push(if targets.is_empty() {
         check(
             "test login",
             Status::Ok,
-            "no sign-in page configured: screenshots open pages directly",
+            "no sign-in page in the settings: portals are detected from the app's login pages when doctest runs, and `doctest login` signs in to each",
         )
     } else if missing.is_empty() {
-        check("test login", Status::Ok, format!("signed in: {}", users.join(", ")))
+        check("test login", Status::Ok, format!("signed in: {}", targets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")))
     } else {
         check(
             "test login",
             Status::Warn,
             format!(
-                "not signed in as {}: run {} (a Chrome window opens; sign in by hand)",
-                missing.join(", "),
-                missing
-                    .iter()
-                    .map(|u| if u == "default" {
-                        "`doctest login`".to_string()
-                    } else {
-                        format!("`doctest login --user {u}`")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "not signed in to {}: run `doctest login` (a Chrome window opens per portal; sign in by hand)",
+                missing.join(", ")
             ),
         )
     });

@@ -285,7 +285,8 @@ impl Shooter {
     }
 
     fn creds(&self, user: &str) -> Result<(String, String), String> {
-        let Some((_, c)) = self.cfg.app.users.iter().find(|(n, _)| n == user) else {
+        let name = self.cfg.creds_user(user).unwrap_or_else(|| user.to_string());
+        let Some((_, c)) = self.cfg.app.users.iter().find(|(n, _)| *n == name) else {
             return Err(format!("user {user} is not in [app.users]"));
         };
         let get = |v: &str| {
@@ -362,7 +363,7 @@ impl Shooter {
                 None
             };
             let (browser, tab) = launch(&self.chrome, true, copy.as_ref().map(|d| d.path()))?;
-            let has_creds = self.cfg.app.users.iter().any(|(n, _)| *n == user);
+            let has_creds = self.cfg.creds_user(&user).is_some();
             if !saved && !login.is_empty() && !has_creds {
                 return Err(format!(
                     "not signed in as {user}: run `doctest login{}` once — a Chrome window opens, you sign in by hand (OTP is fine), and screenshots reuse that session",
