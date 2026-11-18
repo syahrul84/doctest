@@ -4,6 +4,19 @@
 
 Not released yet: being tested on real projects first.
 
+Fixes from the first long run on a real project:
+
+- A page's actions come only from its own components; actions reached through shared screens, layouts or API
+  modules are listed as possible and are not required unless the page shows the button.
+- Fewer required screenshots: the page, one form shot for Add and Edit, one per other action; `<!-- no-data -->`
+  for pages with no records.
+- Safe mode for screenshots (on by default): saves are refused while shooting; `allow_saves` and `[screenshots]
+  allow` to opt in.
+- Chrome: restarted when its connection drops; Chromes left behind are stopped; `doctor` loads a real page.
+- Masks: `hide`, shadow roots, re-applied on re-render, regex `(?i)`, a note for masks that matched nothing.
+  Steps: `wait_text`, `scroll`; `fill` clears the field. `shoot` accepts a flat spec and says when it retook a
+  stored one.
+
 - MCP server and CLI for Laravel + Vue 2/3 projects, built on codemap.
 - User guide per page and per language, one guide per portal, checked against the real screen (labels, buttons,
   messages), with a section per action and screenshots; published alone from `document/guide` (e.g. at `/docs`).

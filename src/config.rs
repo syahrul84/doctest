@@ -62,24 +62,55 @@ pub struct Portal {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Step {
-    Fill { fill: String, value: String },
-    Select { select: String, value: String },
-    Click { click: String },
-    Wait { wait: String },
-    Goto { goto: String },
+    /// Clears the field, then types the value.
+    Fill {
+        fill: String,
+        value: String,
+    },
+    Select {
+        select: String,
+        value: String,
+    },
+    Click {
+        click: String,
+    },
+    /// Waits (up to 10 s) until this text is on the page.
+    WaitText {
+        wait_text: String,
+    },
+    /// Waits (up to 10 s) for an element.
+    Wait {
+        wait: String,
+    },
+    /// Scrolls an element into view (a CSS selector), or `top` / `bottom` of the page.
+    Scroll {
+        scroll: String,
+    },
+    Goto {
+        goto: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Mask {
+    /// Replaces the text (or input value) of every element matching the selector, inside shadow roots too.
     Selector { selector: String, text: String },
+    /// Replaces text matching a JavaScript regular expression (`(?i)` at the start: ignore case).
     Regex { regex: String, text: String },
+    /// Hides every element matching the selector (display:none), inside shadow roots too.
+    Hide { hide: String },
 }
 
 #[derive(Debug, Clone)]
 pub struct ShotConfig {
     pub max_width: u32,
     pub mask: Vec<Mask>,
+    /// Safe mode (default on): while a screenshot is taken the browser refuses POST/PUT/PATCH/DELETE requests, so
+    /// a step cannot save, delete or send anything. A spec opts out with `allow_saves`.
+    pub safe: bool,
+    /// Requests allowed in safe mode, e.g. `POST /api/*/search` (method optional; `*` matches any part).
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +195,9 @@ struct RawShots {
     max_width: Option<u32>,
     #[serde(default)]
     mask: Vec<Mask>,
+    safe: Option<bool>,
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -280,6 +314,8 @@ impl Config {
             screenshots: ShotConfig {
                 max_width: raw.screenshots.max_width.unwrap_or(1600),
                 mask: raw.screenshots.mask,
+                safe: raw.screenshots.safe.unwrap_or(true),
+                allow: raw.screenshots.allow,
             },
             tests: TestConfig {
                 run,

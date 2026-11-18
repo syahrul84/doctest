@@ -68,10 +68,13 @@ locale_steps = [ { goto = "/admin?lang=$lang" } ]   # how to switch the UI langu
 
 [screenshots]
 max_width = 1600
-mask = [                              # text replaced on screen before every capture
-  { selector = ".tenant-name", text = "Demo Tenant" },
-  { regex = "\\b[A-Z]{2}-\\d{2}-\\d{2}\\b", text = "D-01-01" },
+mask = [                              # applied before every capture, inside shadow roots, again when the page re-renders
+  { selector = ".tenant-name", text = "Demo Tenant" },                       # replace text or input values
+  { regex = "\\b[A-Z]{2}-\\d{2}-\\d{2}\\b", text = "D-01-01" },             # JavaScript regex; (?i) ignores case
+  { hide = ".user-avatar" },                                                 # hide elements
 ]
+# safe = true                         # default: the browser refuses POST/PUT/PATCH/DELETE while shooting
+allow = ["POST /api/*/search"]        # requests that only read, let through in safe mode
 
 [tests]
 run = "docker exec shop-backend sh -c 'cd /var/www/api && php artisan test {filter}'"
@@ -100,6 +103,28 @@ login_url = "/session/selfcare/login"
 workers = 4                           # AI workers claiming items, tool calls at the same time
 # parallel_reads = true               # also read pages with several codemap clients (off: slower on big apps)
 ```
+
+## Screenshots
+
+A screenshot is a spec: `path` (with `params` for `:id`), `lang`, `steps`, `crop` (a CSS selector), `mask`. Steps run
+in order: `{ fill = "css", value = "text" }` (clears the field first), `{ select = "css", value = "v" }`,
+`{ click = "css" }`, `{ wait = "css" }`, `{ wait_text = "Saved" }`, `{ scroll = "css" }` (or `"top"`, `"bottom"`),
+`{ goto = "/path" }`. doctest waits for the page's data to finish loading before masking and capturing, and tells
+you which masks matched nothing.
+
+**Safe mode** (on by default): while a screenshot is taken, the browser refuses every request that could change
+data (POST, PUT, PATCH, DELETE), so a step that clicks Save or Delete changes nothing; the reply lists what it
+blocked. A spec sets `allow_saves` to show a real save on test data (retaking it saves again, and doctest warns);
+`[screenshots] allow` lets through requests that only read, such as a search sent as POST.
+
+Each worker has its own Chrome. If Chrome crashes or its connection drops, doctest starts a new one and tries again.
+Every Chrome doctest starts is tagged with its doctest, so Chromes left behind by a doctest that was killed are
+stopped within a minute, and a doctest stops its own when the client closes. `doctest doctor` opens the app in
+headless Chrome to check it loads.
+
+A guide needs the page, one form shot for Add and Edit, and one shot per other action; more only where they help.
+If a page has no records to show, put `<!-- no-data: why -->` in the guide and only what works without records is
+required.
 
 ## Portals and signing in
 

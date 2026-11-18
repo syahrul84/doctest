@@ -3,7 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption;
@@ -32,6 +33,172 @@ pub struct ShotSpec {
     /// Extra masks on top of [screenshots] mask.
     pub mask: Vec<Mask>,
     pub lang: String,
+    /// Let the steps save data (safe mode blocks POST/PUT/PATCH/DELETE otherwise). Re-shooting repeats the save.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_saves: bool,
+}
+
+/// What a capture did besides writing the image.
+#[derive(Debug, Default)]
+pub struct Shot {
+    pub path: PathBuf,
+    /// Requests safe mode refused (`POST /api/x`).
+    pub blocked: Vec<String>,
+    /// Masks that matched nothing on the page.
+    pub unmatched_masks: Vec<String>,
+}
+
+/// Is this request allowed in safe mode? Reads (GET, HEAD, OPTIONS) always are; others only when a pattern in
+/// [screenshots] allow matches (`POST /api/*/search`, or a path alone for any method).
+pub fn allowed(method: &str, url: &str, patterns: &[String]) -> bool {
+    let method = method.to_ascii_uppercase();
+    if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return true;
+    }
+    let path = url
+        .split("://")
+        .nth(1)
+        .and_then(|r| r.split_once('/'))
+        .map(|(_, p)| format!("/{p}"))
+        .unwrap_or_else(|| url.to_string());
+    let path = path.split(['?', '#']).next().unwrap_or_default().to_string();
+    patterns.iter().any(|p| {
+        let (m, pat) = match p.split_once(' ') {
+            Some((m, rest)) if m.chars().all(|c| c.is_ascii_alphabetic()) => {
+                (Some(m.to_ascii_uppercase()), rest.trim())
+            }
+            _ => (None, p.trim()),
+        };
+        if m.as_ref().is_some_and(|m| *m != method) {
+            return false;
+        }
+        let pat = if pat.starts_with('/') {
+            pat.to_string()
+        } else {
+            format!("/{pat}")
+        };
+        let re = format!("^{}$", regex::escape(&pat).replace(r"\*", ".*"));
+        Regex::new(&re).is_ok_and(|r| r.is_match(&path))
+    })
+}
+
+/// Blocks saves while armed and remembers what it blocked.
+#[derive(Default)]
+struct Guard {
+    armed: AtomicBool,
+    blocked: Mutex<Vec<String>>,
+    allow: Vec<String>,
+}
+
+/// Every Chrome doctest starts carries `--doctest-owner=<pid>`, so Chromes left behind by a doctest that died can
+/// be found and stopped.
+static OWNER_ARG: LazyLock<String> = LazyLock::new(|| format!("--doctest-owner={}", std::process::id()));
+
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Chromes started by doctest: (chrome pid, owner pid).
+fn doctest_chromes() -> Vec<(u32, u32)> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let (pid, cmd) = l.split_once(' ')?;
+            let owner = cmd
+                .split_whitespace()
+                .find_map(|a| a.strip_prefix("--doctest-owner="))?;
+            Some((pid.parse().ok()?, owner.parse().ok()?))
+        })
+        .collect()
+}
+
+fn kill(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    let mut c = std::process::Command::new("kill");
+    c.arg("-9");
+    for p in pids {
+        c.arg(p.to_string());
+    }
+    let _ = c.stderr(std::process::Stdio::null()).status();
+}
+
+/// Stops Chromes whose doctest is gone (killed, crashed, its client closed). Returns how many.
+pub fn sweep_orphans() -> usize {
+    let dead: Vec<u32> = doctest_chromes()
+        .into_iter()
+        .filter(|(_, o)| !alive(*o))
+        .map(|(p, _)| p)
+        .collect();
+    kill(&dead);
+    dead.len()
+}
+
+/// Stops every Chrome this doctest started (on exit, or when the MCP client closes stdin).
+pub fn kill_own() {
+    let me = std::process::id();
+    let own: Vec<u32> = doctest_chromes()
+        .into_iter()
+        .filter(|(_, o)| *o == me)
+        .map(|(p, _)| p)
+        .collect();
+    kill(&own);
+}
+
+/// Errors that mean Chrome went away (crashed, closed, the DevTools connection dropped): start a new one.
+fn dropped(e: &str) -> bool {
+    let l = e.to_lowercase();
+    [
+        "connection is closed",
+        "underlying connection",
+        "channel closed",
+        "target closed",
+        "no such target",
+        "transport loop",
+        "websocket",
+    ]
+    .iter()
+    .any(|w| l.contains(w))
+}
+
+/// Waits until the page stops loading resources (data requests of a single-page app included), up to `max`.
+fn settle(tab: &Tab, max: Duration) {
+    let end = std::time::Instant::now() + max;
+    let mut last = -1i64;
+    let mut stable = 0;
+    while std::time::Instant::now() < end {
+        let n = tab
+            .evaluate(
+                "document.readyState === 'complete' ? performance.getEntriesByType('resource').length : -2",
+                false,
+            )
+            .ok()
+            .and_then(|v| v.value)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-2);
+        if n >= 0 && n == last {
+            stable += 1;
+            if stable >= 3 {
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+        last = n;
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":(\w+)|\{(\w+)\??\}").unwrap());
@@ -100,6 +267,7 @@ fn chrome_path() -> Option<PathBuf> {
 }
 
 struct Session {
+    guard: Arc<Guard>,
     _browser: Browser,
     tab: Arc<Tab>,
     lang: Option<String>,
@@ -156,8 +324,10 @@ pub fn copy_profile(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 fn launch(chrome: &Path, headless: bool, profile: Option<&Path>) -> Result<(Browser, Arc<Tab>), String> {
+    let owner = std::ffi::OsStr::new(OWNER_ARG.as_str());
     let opts = LaunchOptions::default_builder()
         .path(Some(chrome.to_path_buf()))
+        .args(vec![owner])
         .headless(headless)
         .window_size(Some((1440, 900)))
         .user_data_dir(profile.map(Path::to_path_buf))
@@ -234,6 +404,33 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     Ok(user.to_string())
 }
 
+/// `doctor`: opens the app's first page in headless Chrome, as screenshots will. Returns the URL it ended on and
+/// how long it took.
+pub fn probe(cfg: &Config) -> Result<(String, f64), String> {
+    let chrome = chrome_path().ok_or("Chrome not found; install Google Chrome or set CHROME_PATH")?;
+    let started = std::time::Instant::now();
+    let (_browser, tab) = launch(&chrome, true, None)?;
+    let (login, _) = cfg.login_for(&default_user(cfg));
+    let url = format!(
+        "{}{}",
+        cfg.app.base_url,
+        if login.is_empty() { "/" } else { login.as_str() }
+    );
+    tab.navigate_to(&url)
+        .and_then(|t| t.wait_until_navigated())
+        .map_err(|e| format!("cannot open {url}: {e}"))?;
+    let status = tab
+        .evaluate("document.body ? document.body.innerText.length : -1", false)
+        .ok()
+        .and_then(|v| v.value)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    if status < 0 {
+        return Err(format!("{url} opened but has no page body"));
+    }
+    Ok((tab.get_url(), started.elapsed().as_secs_f64()))
+}
+
 pub struct Shooter {
     cfg: Config,
     chrome: PathBuf,
@@ -246,28 +443,79 @@ fn mask_js(masks: &[Mask]) -> String {
         .iter()
         .map(|m| match m {
             Mask::Selector { selector, text } => serde_json::json!({"selector": selector, "text": text}),
-            Mask::Regex { regex, text } => serde_json::json!({"regex": regex, "text": text}),
+            Mask::Regex { regex, text } => {
+                let (flags, re) = match regex.strip_prefix("(?i)") {
+                    Some(r) => ("gi", r),
+                    None => ("g", regex.as_str()),
+                };
+                serde_json::json!({"regex": re, "flags": flags, "text": text})
+            }
+            Mask::Hide { hide } => serde_json::json!({"hide": hide}),
         })
         .collect();
+    // Applies the masks now and again whenever the page changes (data arriving late, a re-render), and returns how
+    // many places each mask changed.
     format!(
         r#"(function(masks){{
-  masks.forEach(function(m){{
-    if (m.selector) {{
-      document.querySelectorAll(m.selector).forEach(function(e){{
-        if ('value' in e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA')) {{ e.value = m.text; e.setAttribute('value', m.text); }}
-        else {{ e.textContent = m.text; }}
-      }});
-    }} else if (m.regex) {{
-      var re = new RegExp(m.regex, 'g');
-      var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      var n; while ((n = w.nextNode())) {{ if (re.test(n.nodeValue)) {{ re.lastIndex = 0; n.nodeValue = n.nodeValue.replace(re, m.text); }} }}
-      document.querySelectorAll('input,textarea').forEach(function(e){{ if (re.test(e.value)) {{ re.lastIndex = 0; e.value = e.value.replace(re, m.text); }} }});
-    }}
+  function all(root, sel, out) {{
+    out = out || [];
+    try {{ root.querySelectorAll(sel).forEach(function(e){{ out.push(e); }}); }} catch (x) {{}}
+    root.querySelectorAll('*').forEach(function(e){{ if (e.shadowRoot) all(e.shadowRoot, sel, out); }});
+    return out;
+  }}
+  function texts(root, out) {{
+    out = out || [];
+    var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT); var n;
+    while ((n = w.nextNode())) out.push(n);
+    root.querySelectorAll('*').forEach(function(e){{ if (e.shadowRoot) texts(e.shadowRoot, out); }});
+    return out;
+  }}
+  function apply() {{
+    return masks.map(function(m){{
+      var hits = 0;
+      if (m.hide) {{
+        all(document, m.hide).forEach(function(e){{ hits++; if (e.style.display !== 'none') e.style.setProperty('display', 'none', 'important'); }});
+      }} else if (m.selector) {{
+        all(document, m.selector).forEach(function(e){{
+          hits++;
+          if ('value' in e && (e.tagName === 'INPUT' || e.tagName === 'TEXTAREA')) {{ if (e.value !== m.text) {{ e.value = m.text; e.setAttribute('value', m.text); }} }}
+          else if (e.textContent !== m.text) {{ e.textContent = m.text; }}
+        }});
+      }} else if (m.regex) {{
+        var re; try {{ re = new RegExp(m.regex, m.flags); }} catch (x) {{ return -1; }}
+        texts(document.body).forEach(function(n){{
+          re.lastIndex = 0;
+          if (re.test(n.nodeValue)) {{ re.lastIndex = 0; var v = n.nodeValue.replace(re, m.text); if (v !== n.nodeValue) {{ n.nodeValue = v; hits++; }} }}
+        }});
+        all(document, 'input,textarea').forEach(function(e){{
+          re.lastIndex = 0;
+          if (re.test(e.value)) {{ re.lastIndex = 0; e.value = e.value.replace(re, m.text); hits++; }}
+        }});
+      }}
+      return hits;
+    }});
+  }}
+  if (window.__doctestObserver) window.__doctestObserver.disconnect();
+  var counts = apply();
+  var pending = false;
+  var obs = new MutationObserver(function(){{
+    if (pending) return; pending = true;
+    requestAnimationFrame(function(){{ pending = false; obs.disconnect(); apply(); obs.observe(document.body, {{subtree: true, childList: true, characterData: true}}); }});
   }});
-  return true;
+  obs.observe(document.body, {{subtree: true, childList: true, characterData: true}});
+  window.__doctestObserver = obs;
+  return JSON.stringify(counts);
 }})({})"#,
         serde_json::Value::Array(list)
     )
+}
+
+fn mask_name(m: &Mask) -> String {
+    match m {
+        Mask::Selector { selector, .. } => format!("selector {selector:?}"),
+        Mask::Regex { regex, .. } => format!("regex {regex:?}"),
+        Mask::Hide { hide } => format!("hide {hide:?}"),
+    }
 }
 
 impl Shooter {
@@ -311,10 +559,19 @@ impl Shooter {
             Step::Fill { fill, value } => {
                 let el = find(fill)?;
                 el.click().map_err(|e| format!("step {i}: {e}"))?;
-                // clear, then type, so frameworks see input events
+                // clear what is there (select it all and delete, so frameworks see the change), then type
                 tab.evaluate(
                     &format!(
-                        "(function(){{var e=document.querySelector({});if(e){{e.value='';}}}})()",
+                        "(function(){{var e=document.querySelector({});if(!e)return;e.focus();if(e.select)e.select();else if(e.isContentEditable){{var r=document.createRange();r.selectNodeContents(e);var s=getSelection();s.removeAllRanges();s.addRange(r);}}}})()",
+                        serde_json::to_string(fill).unwrap_or_default()
+                    ),
+                    false,
+                )
+                .map_err(|e| format!("step {i}: {e}"))?;
+                tab.press_key("Backspace").map_err(|e| format!("step {i}: {e}"))?;
+                tab.evaluate(
+                    &format!(
+                        "(function(){{var e=document.querySelector({});if(e&&'value' in e&&e.value!==''){{e.value='';e.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})()",
                         serde_json::to_string(fill).unwrap_or_default()
                     ),
                     false,
@@ -337,6 +594,46 @@ impl Shooter {
             Step::Wait { wait } => {
                 find(wait)?;
             }
+            Step::WaitText { wait_text } => {
+                let want = subst(wait_text);
+                let js = format!(
+                    "document.body.innerText.indexOf({}) >= 0",
+                    serde_json::to_string(&want).unwrap_or_default()
+                );
+                let end = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let seen = tab
+                        .evaluate(&js, false)
+                        .ok()
+                        .and_then(|v| v.value)
+                        .and_then(|v| v.as_bool());
+                    if seen == Some(true) {
+                        break;
+                    }
+                    if std::time::Instant::now() > end {
+                        return Err(format!(
+                            "step {i}: the text {want:?} did not appear on {path} within 10 s"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            Step::Scroll { scroll } => match scroll.as_str() {
+                "top" | "bottom" => {
+                    let y = if scroll == "top" {
+                        "0"
+                    } else {
+                        "document.body.scrollHeight"
+                    };
+                    tab.evaluate(&format!("window.scrollTo(0, {y})"), false)
+                        .map_err(|e| format!("step {i}: {e}"))?;
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                sel => {
+                    find(sel)?.scroll_into_view().map_err(|e| format!("step {i}: {e}"))?;
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            },
             Step::Goto { goto } => {
                 tab.navigate_to(&format!("{base}{}", subst(goto)))
                     .and_then(|t| t.wait_until_navigated())
@@ -385,9 +682,59 @@ impl Shooter {
                         .map_err(|e| format!("signing in as {user}: {e}"))?;
                 }
             }
+            // safe mode: watch data and page requests; the guard refuses saves while a screenshot is taken
+            let guard = Arc::new(Guard {
+                allow: self.cfg.screenshots.allow.clone(),
+                ..Default::default()
+            });
+            if self.cfg.screenshots.safe {
+                use headless_chrome::protocol::cdp::{Fetch, Network};
+                let pattern = |t: Network::ResourceType| Fetch::RequestPattern {
+                    url_pattern: Some("*".into()),
+                    resource_Type: Some(t),
+                    request_stage: Some(Fetch::RequestStage::Request),
+                };
+                tab.enable_fetch(
+                    Some(&[
+                        pattern(Network::ResourceType::Xhr),
+                        pattern(Network::ResourceType::Fetch),
+                        pattern(Network::ResourceType::Document),
+                    ]),
+                    None,
+                )
+                .map_err(|e| format!("cannot turn on safe mode: {e}"))?;
+                let g = guard.clone();
+                tab.enable_request_interception(Arc::new(
+                    move |_t, _s, ev: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent| {
+                        let r = &ev.params.request;
+                        if g.armed.load(Ordering::SeqCst) && !allowed(&r.method, &r.url, &g.allow) {
+                            let path = r
+                                .url
+                                .split("://")
+                                .nth(1)
+                                .and_then(|x| x.split_once('/'))
+                                .map(|(_, p)| p)
+                                .unwrap_or(&r.url);
+                            g.blocked.lock().expect("guard").push(format!(
+                                "{} /{}",
+                                r.method,
+                                path.split('?').next().unwrap_or_default()
+                            ));
+                            headless_chrome::browser::tab::RequestPausedDecision::Fail(Fetch::FailRequest {
+                                request_id: ev.params.request_id.clone(),
+                                error_reason: Network::ErrorReason::BlockedByClient,
+                            })
+                        } else {
+                            headless_chrome::browser::tab::RequestPausedDecision::Continue(None)
+                        }
+                    },
+                ))
+                .map_err(|e| format!("cannot turn on safe mode: {e}"))?;
+            }
             self.sessions.insert(
                 user.clone(),
                 Session {
+                    guard,
                     _browser: browser,
                     tab,
                     lang: None,
@@ -408,16 +755,49 @@ impl Shooter {
         Ok(s.tab.clone())
     }
 
-    /// Takes the screenshot of a spec and writes it (PNG, mode 644, at most max_width wide).
-    pub fn capture(&mut self, spec: &ShotSpec) -> Result<PathBuf, String> {
+    /// Takes the screenshot of a spec and writes it (PNG, mode 644, at most max_width wide). When Chrome went away
+    /// (crashed, or its connection dropped) it starts a new one and tries once more.
+    pub fn capture(&mut self, spec: &ShotSpec) -> Result<Shot, String> {
+        match self.capture_once(spec) {
+            Err(e) if dropped(&e) => {
+                let user = spec.user.clone().unwrap_or_else(|| default_user(&self.cfg));
+                self.sessions.remove(&user);
+                self.capture_once(spec)
+                    .map_err(|e2| format!("{e2} (Chrome was restarted after: {e})"))
+            }
+            r => r,
+        }
+    }
+
+    fn capture_once(&mut self, spec: &ShotSpec) -> Result<Shot, String> {
         validate_spec(spec)?;
         let path = resolve_path(spec)?;
         let tab = self.session(spec.user.as_deref(), &spec.lang)?;
+        let user_key = self.current.clone().unwrap_or_default();
+        let guard = self.sessions[&user_key].guard.clone();
+        guard.blocked.lock().expect("guard").clear();
+        guard
+            .armed
+            .store(self.cfg.screenshots.safe && !spec.allow_saves, Ordering::SeqCst);
+        let r = self.shoot_page(&tab, spec, &path);
+        guard.armed.store(false, Ordering::SeqCst);
+        let blocked = std::mem::take(&mut *guard.blocked.lock().expect("guard"));
+        let (out, unmatched_masks) = r?;
+        Ok(Shot {
+            path: out,
+            blocked,
+            unmatched_masks,
+        })
+    }
+
+    fn shoot_page(&mut self, tab: &Arc<Tab>, spec: &ShotSpec, path: &str) -> Result<(PathBuf, Vec<String>), String> {
+        let tab = tab.clone();
+        let path = path.to_string();
         let base = self.cfg.app.base_url.clone();
         tab.navigate_to(&format!("{base}{path}"))
             .and_then(|t| t.wait_until_navigated())
             .map_err(|e| format!("cannot open {base}{path}: {e}"))?;
-        std::thread::sleep(Duration::from_millis(400));
+        settle(&tab, Duration::from_secs(8));
         let user = self.current.clone().unwrap_or_default();
         let (login_url, _) = self.cfg.login_for(&user);
         if !path.starts_with(&login_url) && on_login_page(&tab.get_url(), &login_url) {
@@ -435,16 +815,39 @@ impl Shooter {
         for (i, step) in spec.steps.iter().enumerate() {
             Self::run_step(&tab, i + 1, step, &path, &subst, &base)?;
         }
+        settle(&tab, Duration::from_secs(5));
         let masks: Vec<Mask> = self.cfg.screenshots.mask.iter().chain(&spec.mask).cloned().collect();
-        tab.evaluate(&mask_js(&masks), false)
-            .map_err(|e| format!("masking failed: {e}"))?;
-        std::thread::sleep(Duration::from_millis(150));
+        let counts = tab
+            .evaluate(&mask_js(&masks), false)
+            .map_err(|e| format!("masking failed: {e}"))?
+            .value
+            .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok()))
+            .unwrap_or_default();
+        let unmatched: Vec<String> = masks
+            .iter()
+            .zip(counts.iter().chain(std::iter::repeat(&0)))
+            .filter(|(_, n)| **n <= 0)
+            .map(|(m, n)| {
+                if *n < 0 {
+                    format!("{} (not a valid JavaScript regular expression)", mask_name(m))
+                } else {
+                    mask_name(m)
+                }
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(250));
         let png = match &spec.crop {
-            Some(sel) => tab
-                .wait_for_element_with_custom_timeout(sel, Duration::from_secs(10))
-                .map_err(|_| format!("crop selector {sel:?} not found on {path}"))?
-                .capture_screenshot(CaptureScreenshotFormatOption::Png)
-                .map_err(|e| format!("screenshot failed: {e}"))?,
+            Some(sel) => {
+                let el = tab
+                    .wait_for_element_with_custom_timeout(sel, Duration::from_secs(10))
+                    .map_err(|_| format!("crop selector {sel:?} not found on {path}"))?;
+                // below the first screen: bring it into view and let it render before capturing
+                el.scroll_into_view()
+                    .map_err(|e| format!("cannot scroll to {sel:?}: {e}"))?;
+                std::thread::sleep(Duration::from_millis(400));
+                el.capture_screenshot(CaptureScreenshotFormatOption::Png)
+                    .map_err(|e| format!("screenshot failed: {e}"))?
+            }
             None => tab
                 .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
                 .map_err(|e| format!("screenshot failed: {e}"))?,
@@ -466,7 +869,7 @@ impl Shooter {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).map_err(|e| e.to_string())?;
         }
-        Ok(out)
+        Ok((out, unmatched))
     }
 
     #[cfg(test)]
@@ -641,6 +1044,92 @@ mod tests {
     }
 
     #[test]
+    fn safe_mode_allows_reads_and_listed_requests() {
+        let allow = vec!["POST /api/*/search".to_string(), "/api/login".to_string()];
+        assert!(allowed("GET", "http://x/api/orders", &[]));
+        assert!(!allowed("POST", "http://x/api/orders", &allow));
+        assert!(!allowed("delete", "http://x/api/orders/1", &allow));
+        assert!(allowed("POST", "http://x/api/orders/search?q=1", &allow));
+        assert!(!allowed("PUT", "http://x/api/orders/search", &allow));
+        assert!(allowed("PUT", "http://x/api/login", &allow));
+    }
+
+    #[test]
+    fn new_steps_and_masks_parse() {
+        let steps: Vec<Step> = serde_json::from_str(
+            r##"[{"wait_text":"Saved"},{"scroll":"bottom"},{"wait":".x"},{"fill":"#a","value":"b"}]"##,
+        )
+        .unwrap();
+        assert!(matches!(steps[0], Step::WaitText { .. }));
+        assert!(matches!(steps[1], Step::Scroll { .. }));
+        assert!(matches!(steps[2], Step::Wait { .. }));
+        let masks: Vec<Mask> = serde_json::from_str(r#"[{"hide":".x"},{"regex":"(?i)ab","text":"c"}]"#).unwrap();
+        assert!(matches!(masks[0], Mask::Hide { .. }));
+        let js = mask_js(&masks);
+        assert!(js.contains(r#""flags":"gi""#) && js.contains(r#""regex":"ab""#), "{js}");
+    }
+
+    #[test]
+    fn finds_doctest_chromes_by_owner() {
+        assert!(OWNER_ARG.starts_with("--doctest-owner="));
+        assert!(dropped(
+            "Unable to make method calls because underlying connection is closed"
+        ));
+        assert!(!dropped("selector \"#x\" not found"));
+        // our own process is alive, so nothing of ours is an orphan
+        assert!(alive(std::process::id()));
+    }
+
+    #[test]
+    #[ignore = "needs Chrome"]
+    fn safe_mode_blocks_saves_and_masks_late_data() {
+        let port = serve();
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = live_cfg(d.path(), port);
+        cfg.screenshots.allow = vec!["POST /api/*/search".into()];
+        cfg.screenshots.mask.push(Mask::Hide { hide: ".secret".into() });
+        let mut sh = Shooter::start(&cfg).unwrap();
+        let mut s = spec("/save.html");
+        s.steps = vec![
+            Step::Fill {
+                fill: "#name".into(),
+                value: "new".into(),
+            },
+            Step::Click { click: "#save".into() },
+            Step::WaitText {
+                wait_text: "Refused".into(),
+            },
+            Step::Scroll {
+                scroll: "bottom".into(),
+            },
+        ];
+        let shot = sh.capture(&s).unwrap();
+        assert_eq!(shot.blocked, vec!["POST /api/orders"]);
+        assert_eq!(sh.input_value("#name").unwrap(), "new");
+        let text = sh.page_text().unwrap();
+        assert!(!text.contains("Secret panel"), "{text}");
+        assert!(text.contains("D-01-01") && !text.contains("AB-99-99"), "{text}");
+        // the late text is masked once it arrives
+        std::thread::sleep(Duration::from_millis(900));
+        let text = sh.page_text().unwrap();
+        assert!(!text.contains("CD-11-22"), "{text}");
+        // a listed read is let through; Chrome's own process is tagged with the owner
+        let mut s2 = spec("/save.html");
+        s2.steps = vec![Step::Click {
+            click: "#search".into(),
+        }];
+        let shot = sh.capture(&s2).unwrap();
+        assert!(shot.blocked.is_empty(), "{:?}", shot.blocked);
+        assert!(doctest_chromes().iter().any(|(_, o)| *o == std::process::id()));
+        drop(sh);
+        let n = doctest_chromes()
+            .iter()
+            .filter(|(_, o)| *o == std::process::id())
+            .count();
+        assert_eq!(n, 0, "Chrome left running after the shooter closed");
+    }
+
+    #[test]
     #[ignore = "needs Chrome"]
     fn captures_masked_png() {
         use std::os::unix::fs::PermissionsExt;
@@ -654,7 +1143,7 @@ mod tests {
             selector: ".email".into(),
             text: "demo@example.com".into(),
         }];
-        let out = sh.capture(&s).unwrap();
+        let out = sh.capture(&s).unwrap().path;
         assert!(out.is_file());
         assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o644);
         let img = image::open(&out).unwrap();
@@ -722,7 +1211,7 @@ mod tests {
         let mut sh = Shooter::start(&cfg).unwrap();
         let mut s = spec("/orders.html");
         s.crop = Some(".card".into());
-        let img = image::open(sh.capture(&s).unwrap()).unwrap();
+        let img = image::open(sh.capture(&s).unwrap().path).unwrap();
         assert!(img.height() < 200, "{}", img.height());
     }
 }

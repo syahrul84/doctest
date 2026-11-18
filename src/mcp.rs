@@ -19,6 +19,8 @@ use crate::state::{CoverSource, RunRecord, State};
 use crate::testwrite::{self, NewTests};
 use crate::work::{self, Scope};
 
+const SHOOT_HELP: &str = "Take (or retake) a screenshot. Send a spec {id, page, path, params, user, lang, steps, crop, mask, allow_saves}, or an id alone to retake its stored spec. Returns the image and the path to reference.\nsteps (in order): {\"fill\": \"css\", \"value\": \"text\"} clears the field then types; {\"select\": \"css\", \"value\": \"v\"}; {\"click\": \"css\"}; {\"wait\": \"css\"} waits for an element; {\"wait_text\": \"Saved\"} waits for text; {\"scroll\": \"css\" | \"top\" | \"bottom\"}; {\"goto\": \"/path\"}.\nmask (on top of [screenshots] mask; inside shadow roots too, re-applied when the page re-renders): {\"selector\": \"css\", \"text\": \"Demo\"} replaces text or input values; {\"regex\": \"[A-Z]{2}-\\\\d+\", \"text\": \"AB-1\"} a JavaScript regex ((?i) at the start ignores case); {\"hide\": \"css\"} hides elements. The reply names masks that matched nothing.\ncrop: a CSS selector to capture just that element (scrolled into view first).\nSafe mode (on unless [screenshots] safe = false): the browser refuses POST/PUT/PATCH/DELETE while shooting, so steps cannot save or delete; the reply lists what it blocked. Set allow_saves only to show a real save result, on test data; retaking that spec saves again.";
+
 pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan: the page, one form shot for Add and Edit, one per other action), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
@@ -107,8 +109,8 @@ pub fn tools() -> Value {
         ),
         tool(
             "shoot",
-            "Take (or retake) a screenshot from a spec {id, page, path, params, user, steps, crop, mask, lang} or a stored spec id. Returns the image and the path to reference.",
-            json!({"spec": {"type": "object"}, "id": {"type": "string"}}),
+            SHOOT_HELP,
+            json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}}),
             &[]
         ),
         tool(
@@ -791,10 +793,32 @@ pub fn summary(tool: &str, outcome: Result<&str, &str>, elapsed: std::time::Dura
                         )
                     }
                 }
-                "shoot" => (
-                    "nothing wrong".into(),
-                    "put the image in the guide with the path above, then continue".into(),
-                ),
+                "shoot" => {
+                    let blocked = text.contains("safe mode blocked");
+                    let masks = text.contains("masks that matched nothing");
+                    let mut found = Vec::new();
+                    if blocked {
+                        found.push("safe mode blocked a save");
+                    }
+                    if masks {
+                        found.push("some masks matched nothing");
+                    }
+                    if text.contains("saved again") {
+                        found.push("a retake repeated a save");
+                    }
+                    (
+                        if found.is_empty() {
+                            "nothing wrong".into()
+                        } else {
+                            found.join("; ")
+                        },
+                        if found.is_empty() {
+                            "put the image in the guide with the path above, then continue".into()
+                        } else {
+                            "read the notes above; retake if the image is wrong, else put it in the guide".into()
+                        },
+                    )
+                }
                 "write_test" => {
                     let failed: Vec<String> = text
                         .lines()
@@ -1440,13 +1464,33 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
 
 fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
     let st = State::load(&p.cfg);
+    let mut notes: Vec<String> = Vec::new();
+    // a spec object, the spec's fields sent flat, or an id alone (retake the stored spec)
+    let flat = ["path", "steps", "crop", "mask", "params", "lang", "page"]
+        .iter()
+        .any(|k| args.get(*k).is_some());
     let spec: ShotSpec = match (args.get("spec"), s(args, "id")) {
         (Some(v), _) if v.is_object() => serde_json::from_value(v.clone()).map_err(|e| format!("bad spec: {e}"))?,
-        (_, Some(id)) => st
-            .shots
-            .get(id)
-            .cloned()
-            .ok_or_else(|| format!("no stored spec {id}; send a spec"))?,
+        _ if flat => {
+            let mut v = args.clone();
+            if let Some(o) = v.as_object_mut() {
+                o.remove("project");
+            }
+            serde_json::from_value(v).map_err(|e| format!("bad spec: {e}"))?
+        }
+        (_, Some(id)) => {
+            let stored = st
+                .shots
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("no stored spec {id}; send a spec"))?;
+            notes.push(format!(
+                "retook the stored spec of {id} (path {}, {} step(s)); to change it, send the whole spec",
+                stored.path,
+                stored.steps.len()
+            ));
+            stored
+        }
         _ => return Err("send spec or id".into()),
     };
     let mut spec = spec;
@@ -1455,10 +1499,16 @@ fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
     crate::shots::validate_spec(&spec)?;
     crate::shots::resolve_path(&spec)?;
     check_lang(&p.cfg, &spec.lang)?;
+    if spec.allow_saves && eff.screenshots.safe && st.shots.contains_key(&spec.id) {
+        notes.push(format!(
+            "warning: {} lets its steps save data, and it was taken before: this retake saved again (check for a duplicate record)",
+            spec.id
+        ));
+    }
     if p.shooter.is_none() {
         p.shooter = Some(Shooter::start(&eff)?);
     }
-    let path = p.shooter.as_mut().expect("started").capture(&spec)?;
+    let shot = p.shooter.as_mut().expect("started").capture(&spec)?;
     State::update(&p.cfg, |st| {
         st.shots.insert(spec.id.clone(), spec.clone());
         let e = st.pages.entry(spec.page.clone()).or_default();
@@ -1467,9 +1517,30 @@ fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
         }
         st.done(&format!("shot:{}", spec.id));
     })?;
-    let png = std::fs::read(&path).map_err(|e| e.to_string())?;
+    if !shot.blocked.is_empty() {
+        notes.push(format!(
+            "safe mode blocked {}: {} — nothing was saved. If the screen shows an error because of it, take the shot before that step; to show a real save, send allow_saves: true (test data only); for a request that only reads (a search sent as POST), add it to [screenshots] allow",
+            if shot.blocked.len() == 1 { "a request".to_string() } else { format!("{} requests", shot.blocked.len()) },
+            shot.blocked.join(", ")
+        ));
+    }
+    if !shot.unmatched_masks.is_empty() {
+        notes.push(format!(
+            "masks that matched nothing on this page: {} (fine if the page has no such data; else fix the selector or regex)",
+            shot.unmatched_masks.join(", ")
+        ));
+    }
+    let png = std::fs::read(&shot.path).map_err(|e| e.to_string())?;
+    let mut text = format!(
+        "saved {}; reference it as ![…]({})",
+        shot.path.display(),
+        crate::shots::image_ref(&spec)
+    );
+    for n in &notes {
+        text += &format!("\n- {n}");
+    }
     Ok(vec![
-        json!({"type": "text", "text": format!("saved {}; reference it as ![…]({})", path.display(), crate::shots::image_ref(&spec))}),
+        json!({"type": "text", "text": text}),
         json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(png), "mimeType": "image/png"}),
     ])
 }
@@ -1737,6 +1808,16 @@ fn filter_all(cfg: &Config) -> String {
 /// and Chrome, so several calls can run at the same time.
 pub fn serve(workers: usize) {
     crate::update::check_in_background();
+    // Chromes left behind by a doctest that was killed: stop them now and every minute
+    std::thread::spawn(|| {
+        loop {
+            let n = crate::shots::sweep_orphans();
+            if n > 0 {
+                eprintln!("doctest: stopped {n} Chrome(s) left behind by a doctest that is gone");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
     let out: crate::progress::Shared = std::sync::Arc::new(std::sync::Mutex::new(Box::new(std::io::stdout())));
     let write = |out: &crate::progress::Shared, reply: Value| {
         let mut w = out.lock().unwrap_or_else(|e| e.into_inner());
@@ -1773,10 +1854,11 @@ pub fn serve(workers: usize) {
             write(&out, reply);
         }
     }
+    // the client went away: stop our Chromes and leave, without waiting for calls nobody will read
     drop(tx);
-    for h in handles {
-        let _ = h.join();
-    }
+    drop(handles);
+    crate::shots::kill_own();
+    std::process::exit(0);
 }
 
 #[cfg(test)]

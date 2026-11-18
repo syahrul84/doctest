@@ -220,6 +220,21 @@ pub fn run(cfg: Option<&Config>, start: &Path) -> Vec<Check> {
             ),
         )
     });
+    // a real page load in headless Chrome, as screenshots do (skipped in doctest's own tests)
+    if !cfg.app.base_url.is_empty() && !cfg!(test) {
+        out.push(match crate::shots::probe(cfg) {
+            Ok((url, secs)) => check(
+                "page load",
+                Status::Ok,
+                format!("headless Chrome opened {url} in {secs:.1}s"),
+            ),
+            Err(e) => check(
+                "page load",
+                Status::Fail,
+                format!("{e} — is the app running at {}? Screenshots need it", cfg.app.base_url),
+            ),
+        });
+    }
     let first = cfg.tests.run.split_whitespace().next().unwrap_or_default().to_string();
     out.push(if on_path(&first) {
         check("tests", Status::Ok, format!("`{}`", cfg.tests.run))

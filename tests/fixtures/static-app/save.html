@@ -1,0 +1,14 @@
+<!doctype html><html><body>
+<div class="admin-layout">
+  <h1>Save</h1>
+  <input id="name" value="old value">
+  <div class="secret">Secret panel</div>
+  <button id="save" onclick="fetch('/api/orders', {method: 'POST', body: '{}'}).then(function(){ document.getElementById('out').textContent = 'Saved'; }, function(){ document.getElementById('out').textContent = 'Refused'; })">Save</button>
+  <button id="search" onclick="fetch('/api/orders/search', {method: 'POST', body: '{}'}).then(function(){ document.getElementById('out').textContent = 'Searched'; }, function(){ document.getElementById('out').textContent = 'Refused'; })">Search</button>
+  <div id="out"></div>
+  <div id="late"></div>
+  <div style="height:3000px"></div>
+  <div id="footer">Bottom AB-99-99</div>
+</div>
+<script>setTimeout(function(){ document.getElementById('late').textContent = 'Late CD-11-22'; }, 600);</script>
+</body></html>
