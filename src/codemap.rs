@@ -78,6 +78,11 @@ pub fn binary() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin/codemap")
 }
 
+/// A failed write to codemap's stdin: it has exited (broken pipe) or cannot take input.
+fn write_error(method: &str, e: &std::io::Error, stderr_tail: &str) -> String {
+    format!("codemap stopped while sending {method} ({e}){stderr_tail}")
+}
+
 struct Server {
     child: Child,
     stdin: ChildStdin,
@@ -152,9 +157,14 @@ impl Server {
     }
 
     fn send(&mut self, message: &Value) -> Result<(), String> {
+        let method = message["method"].as_str().unwrap_or("a request").to_string();
         writeln!(self.stdin, "{message}")
             .and_then(|_| self.stdin.flush())
-            .map_err(|e| format!("codemap: {e}{}", self.stderr_tail()))
+            .map_err(|e| {
+                // codemap exited before reading: give it a moment to finish writing why
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                write_error(&method, &e, &self.stderr_tail())
+            })
     }
 
     fn rpc(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -428,6 +438,20 @@ mod tests {
             2,
             "a dead codemap must be started again"
         );
+    }
+
+    #[test]
+    fn a_write_to_a_dead_codemap_counts_as_stopped() {
+        let e = write_error(
+            "initialize",
+            &std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            " (codemap said: index is locked)",
+        );
+        assert!(
+            e.contains("codemap stopped") && e.contains("initialize") && e.contains("index is locked"),
+            "{e}"
+        );
+        assert!(crate::reports::is_internal(&e));
     }
 
     #[test]
