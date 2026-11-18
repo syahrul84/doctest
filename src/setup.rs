@@ -240,7 +240,10 @@ mod tests {
         ] {
             assert!(b.contains(want), "{want} missing");
         }
-        assert!(!b.contains("/Users/") && !b.contains("~/Documents"), "no local paths in the shared rules");
+        assert!(
+            !b.contains("/Users/") && !b.contains("~/Documents"),
+            "no local paths in the shared rules"
+        );
     }
 
     fn opts(dir: &std::path::Path, scope: Scope) -> Opts {

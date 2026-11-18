@@ -36,6 +36,17 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
+/// `en`, `id`, `zh`, `pt-BR`, `zh_CN` — not `index`, `messages`.
+fn is_language_code(stem: &str) -> bool {
+    let (base, region) = match stem.split_once(['-', '_']) {
+        Some((b, r)) => (b, Some(r)),
+        None => (stem, None),
+    };
+    (2..=3).contains(&base.len())
+        && base.chars().all(|c| c.is_ascii_lowercase())
+        && region.is_none_or(|r| (2..=4).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 pub fn run(dir: &Path) -> Result<PathBuf, String> {
     let dir = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(crate::config::FILE);
@@ -49,11 +60,13 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
             dir.display()
         ));
     }
+    let folder = crate::config::Config::repo_name(&dir);
     let name = composer["name"]
         .as_str()
+        .filter(|n| !matches!(*n, "laravel/laravel" | "laravel/lumen" | "laravel/framework"))
         .and_then(|n| n.rsplit('/').next())
         .map(String::from)
-        .unwrap_or_else(|| crate::config::Config::repo_name(&dir));
+        .unwrap_or(folder);
     let mut frontends: Vec<String> = Vec::new();
     if let Some(parent) = dir.parent()
         && let Ok(entries) = std::fs::read_dir(parent)
@@ -69,7 +82,8 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
         }
     }
     let mut langs: Vec<String> = Vec::new();
-    let mut menu: Option<String> = None;
+    // the menu file: of the files named *menu* that use routeName, the one with the most entries
+    let mut menu: Option<(usize, String)> = None;
     for fe in &frontends {
         let root = dir.join(fe);
         let mut files = Vec::new();
@@ -85,7 +99,7 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
             let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
             if matches!(parent, "locales" | "locale" | "lang" | "i18n")
                 && matches!(ext, "json" | "ts" | "js")
-                && stem.len() <= 5
+                && is_language_code(stem)
                 && !langs.contains(&stem.to_string())
             {
                 langs.push(stem.to_string());
@@ -95,13 +109,14 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_lowercase();
-            if menu.is_none()
-                && lower.contains("menu")
-                && matches!(ext, "ts" | "js")
-                && std::fs::read_to_string(f).is_ok_and(|t| t.contains("routeName"))
-            {
-                let rel = f.strip_prefix(&root).unwrap_or(f);
-                menu = Some(format!("{fe}/{}", rel.to_string_lossy()));
+            if lower.contains("menu") && matches!(ext, "ts" | "js") {
+                let entries = std::fs::read_to_string(f)
+                    .map(|t| t.matches("routeName:").count())
+                    .unwrap_or(0);
+                if entries > 0 && menu.as_ref().is_none_or(|(n, _)| entries > *n) {
+                    let rel = f.strip_prefix(&root).unwrap_or(f);
+                    menu = Some((entries, format!("{fe}/{}", rel.to_string_lossy())));
+                }
             }
         }
     }
@@ -127,7 +142,7 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
     t += "[app]   # the running app used for screenshots\nbase_url = \"http://localhost:8000\"   # TODO\nlogin_url = \"/login\"   # TODO\nlogin_steps = [   # TODO: selectors of your sign-in form\n  { fill = \"input[name=email]\", value = \"$user\" },\n  { fill = \"input[name=password]\", value = \"$password\" },\n  { click = \"button[type=submit]\" },\n]\n\n[app.users.admin]   # TODO: set these env vars to a test admin account\nuser_env = \"DOCTEST_USER\"\npassword_env = \"DOCTEST_PASSWORD\"\n\n";
     t += "[screenshots]\nmax_width = 1600\nmask = [   # TODO: replace names and numbers that may be real data\n]\n\n";
     t += "[tests]\nrun = \"php artisan test {filter}\"   # TODO: e.g. docker exec <container> sh -c 'cd /app && php artisan test {filter}'\n\n";
-    t += &format!("[guide]\n{}allow_bold = []\n", match &menu {
+    t += &format!("[guide]\n{}allow_bold = []\n", match menu.as_ref().map(|(_, m)| m) {
         Some(m) => format!("modules_from = \"{m}\"\n"),
         None => "# modules_from = \"../web/src/config/menu.ts\"   # TODO: menu file with routeName entries, for chapters\n".into(),
     });
@@ -138,6 +153,46 @@ pub fn run(dir: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_guesses_like_a_person_would() {
+        let d = tempfile::tempdir().unwrap();
+        let api = d.path().join("shop-api");
+        let web = d.path().join("shop-web");
+        std::fs::create_dir_all(&api).unwrap();
+        std::fs::create_dir_all(web.join("src/i18n/locales")).unwrap();
+        std::fs::create_dir_all(web.join("src/config")).unwrap();
+        std::fs::create_dir_all(web.join("src/composables")).unwrap();
+        std::fs::write(api.join("composer.json"), r#"{"name":"laravel/laravel"}"#).unwrap();
+        std::fs::write(web.join("package.json"), r#"{"dependencies":{"vue":"^3.5"}}"#).unwrap();
+        std::fs::write(web.join("src/i18n/index.ts"), "export default {}").unwrap();
+        std::fs::write(web.join("src/i18n/messages.ts"), "export default {}").unwrap();
+        std::fs::write(web.join("src/i18n/locales/en.ts"), "export default {}").unwrap();
+        std::fs::write(web.join("src/i18n/locales/zh.ts"), "export default {}").unwrap();
+        std::fs::write(
+            web.join("src/composables/useAdminMenuTree.ts"),
+            "const x = item.routeName",
+        )
+        .unwrap();
+        std::fs::write(
+            web.join("src/config/adminMenuGroups.ts"),
+            "{ routeName: 'a' }, { routeName: 'b' }, { routeName: 'c' }",
+        )
+        .unwrap();
+        let t = std::fs::read_to_string(run(&api).unwrap()).unwrap();
+        assert!(
+            t.contains("name = \"shop-api\""),
+            "a generic composer name falls back to the folder: {t}"
+        );
+        assert!(
+            t.contains("languages = [\"en\", \"zh\"]"),
+            "index/messages are not languages: {t}"
+        );
+        assert!(
+            t.contains("modules_from = \"../shop-web/src/config/adminMenuGroups.ts\""),
+            "the file with the most routeName entries: {t}"
+        );
+    }
 
     #[test]
     fn init_writes_toml_with_todos() {
