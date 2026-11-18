@@ -539,9 +539,14 @@ pub fn build(cfg: &Config, sources: &[Source], state: &State) -> Result<BuildRep
                 )
             })
             .collect();
+        let took = r
+            .seconds
+            .map(|s| format!(" — took {}", crate::work::duration(s)))
+            .unwrap_or_default();
         content += &format!(
-            "<h2>{}</h2>\n<p>{}</p>\n<p>{}</p>\n<ul>",
+            "<h2>{}{}</h2>\n<p>{}</p>\n<p>{}</p>\n<ul>",
             esc(&r.at),
+            esc(&took),
             commits.join(", "),
             esc(&r.note)
         );
@@ -718,10 +723,12 @@ mod tests {
             commits: [("shop".to_string(), "abc1234".to_string())].into(),
             updated: vec!["guide:en:shop.orders.create".into()],
             note: "first".into(),
+            seconds: Some(61),
         });
         build(&cfg, &sample(), &st).unwrap();
         let c = read(&cfg, "system/changes.html");
         assert!(c.contains("abc1234") && c.contains("guide:en:shop.orders.create"));
+        assert!(c.contains("took 1m 1s"), "{c}");
     }
 
     fn portal_config(dir: &Path) -> Config {

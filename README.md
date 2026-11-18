@@ -107,8 +107,19 @@ workers = 4                           # AI workers claiming items, tool calls at
 
 ## Use
 
-In Claude Code, ask for the work: "use doctest to document and test the latest changes" or "…the whole system".
-The MCP tools:
+In Claude Code, type one of doctest's commands:
+
+| Command | Does |
+| --- | --- |
+| `/mcp__doctest__all` | Document and test the whole application: everything missing or out of date |
+| `/mcp__doctest__all redo` | The same, rewriting every guide and retaking its screenshots |
+| `/mcp__doctest__branch` | Only what this git branch changed (compared with main/master); `/mcp__doctest__branch develop` compares with develop |
+| `/mcp__doctest__changes` | Only what changed since the last finished run |
+
+One worker does the work unless you add a number: `/mcp__doctest__all 4` runs four in parallel. At the end doctest
+reports how long the run took (also on the changes page) and what it wrote.
+
+The MCP tools behind these commands:
 
 | Tool | Does |
 | --- | --- |

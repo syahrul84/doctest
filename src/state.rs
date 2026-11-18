@@ -28,6 +28,8 @@ pub struct State {
     pub reasons: BTreeMap<String, String>,
     /// Items written since the last finish (for the changelog).
     pub written: Vec<String>,
+    /// When the current run started (unix seconds): the first status, plan or claim after a finish.
+    pub run_started: Option<u64>,
 }
 
 /// A lock held by creating a file; removed on drop. A lock older than two minutes is taken over.
@@ -132,6 +134,9 @@ pub struct RunRecord {
     pub commits: BTreeMap<String, String>,
     pub updated: Vec<String>,
     pub note: String,
+    /// How long the run took, from its first status/plan/claim to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u64>,
 }
 
 pub use crate::shots::ShotSpec;

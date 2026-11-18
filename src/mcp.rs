@@ -61,19 +61,19 @@ pub fn tools() -> Value {
         tool(
             "status",
             "Counts and the first items of what is missing or stale: guides, translations, process guides, screenshots, system document sections, test cases.",
-            json!({"scope": scope, "base": base, "limit": {"type": "integer"}}),
+            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}}),
             &[]
         ),
         tool(
             "plan",
             "The ordered work items (id, kind, reason). Work through them with facts → write_doc / shoot / write_test.",
-            json!({"scope": scope, "base": base, "limit": {"type": "integer"}}),
+            json!({"scope": scope, "base": base, "limit": {"type": "integer"}, "redo": {"type": "boolean", "description": "list every page guide again (rewrite all), not only missing or stale ones"}}),
             &[]
         ),
         tool(
             "claim",
             "For parallel AI workers: hands this worker its own next work items (not claimed by others; claims expire after 30 minutes). Refreshes the queue from a plan when empty or refresh is true.",
-            json!({"worker": {"type": "string"}, "count": {"type": "integer"}, "kinds": {"type": "array", "items": {"type": "string"}}, "refresh": {"type": "boolean"}, "scope": scope, "base": base}),
+            json!({"worker": {"type": "string"}, "count": {"type": "integer"}, "kinds": {"type": "array", "items": {"type": "string"}}, "refresh": {"type": "boolean"}, "redo": {"type": "boolean"}, "scope": scope, "base": base}),
             &["worker"]
         ),
         tool(
@@ -225,12 +225,31 @@ impl Server {
         Some(match message["method"].as_str().unwrap_or_default() {
             "initialize" => answer(json!({
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "prompts": {}},
                 "serverInfo": {"name": "doctest", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": MCP_INSTRUCTIONS,
             })),
             "ping" => answer(json!({})),
             "tools/list" => answer(json!({"tools": tools()})),
+            "prompts/list" => answer(json!({"prompts": prompts()})),
+            "prompts/get" => {
+                let name = params["name"].as_str().unwrap_or_default();
+                let words: Vec<String> = params["arguments"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(_, v)| v.as_str())
+                    .flat_map(|v| v.split_whitespace().map(String::from).collect::<Vec<_>>())
+                    .collect();
+                match prompt_text(name, &words) {
+                    Some(text) => answer(
+                        json!({"description": format!("doctest {name}"), "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}),
+                    ),
+                    None => {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown prompt {name}; prompts: all, branch, changes")}})
+                    }
+                }
+            }
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default().to_string();
                 let args = params.get("arguments").cloned().unwrap_or(Value::Object(Map::new()));
@@ -321,7 +340,10 @@ impl Server {
         match name {
             "status" | "plan" => {
                 let mut st = State::load(&p.cfg);
-                let plan = run_plan(&factory, p, &mut st, &scope, progress)?;
+                let mut plan = run_plan(&factory, p, &mut st, &scope, progress)?;
+                if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
+                    work::add_redo(&mut plan, &p.cfg, &st);
+                }
                 if name == "status" {
                     text(pretty(&work::status(&plan, &scope, limit)))
                 } else {
@@ -342,7 +364,10 @@ impl Server {
                     || State::load(&p.cfg).queue.is_empty();
                 if refresh {
                     let mut st = State::load(&p.cfg);
-                    let plan = run_plan(&factory, p, &mut st, &scope, progress)?;
+                    let mut plan = run_plan(&factory, p, &mut st, &scope, progress)?;
+                    if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
+                        work::add_redo(&mut plan, &p.cfg, &st);
+                    }
                     let items: Vec<&work::WorkItem> = plan
                         .items
                         .iter()
@@ -458,11 +483,13 @@ impl Server {
                 let st = State::update(&p.cfg, |st| {
                     st.last_commit = commits.clone();
                     let updated = std::mem::take(&mut st.written);
+                    let seconds = st.run_started.take().map(|t| crate::state::now().saturating_sub(t));
                     st.runs.push(RunRecord {
                         at: chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string(),
                         commits,
                         updated,
                         note,
+                        seconds,
                     });
                     st.queue.clear();
                     st.claims.clear();
@@ -471,8 +498,14 @@ impl Server {
                 })?;
                 let sources = source::sources(&p.cfg)?;
                 crate::html::build(&p.cfg, &sources, &st)?;
+                let last = st.runs.last();
+                let took = last
+                    .and_then(|r| r.seconds)
+                    .map(|s| format!("took {}; ", work::duration(s)))
+                    .unwrap_or_default();
+                let written = last.map(|r| r.updated.len()).unwrap_or(0);
                 text(format!(
-                    "finished: commits recorded for {} repo(s); the next changes scope starts here",
+                    "finished: {took}{written} item(s) written; commits recorded for {} repo(s); the next changes scope starts here",
                     st.last_commit.len()
                 ))
             }
@@ -503,6 +536,82 @@ fn report_kind(error: &str) -> &'static str {
     }
 }
 
+pub fn prompts() -> Value {
+    json!([
+        {"name": "all", "description": "Document and test the whole application: every guide, screenshot, translation, system section and test case that is missing or out of date. Options: a number of workers (default 1), `redo` to rewrite every guide.",
+         "arguments": [{"name": "options", "description": "optional: workers (e.g. 4) and/or redo", "required": false}]},
+        {"name": "branch", "description": "Document and test only what this git branch changed (compared with main/master). Options: a base branch, a number of workers (default 1).",
+         "arguments": [{"name": "options", "description": "optional: base branch and/or workers", "required": false}]},
+        {"name": "changes", "description": "Document and test what changed since the last finished doctest run. Option: a number of workers (default 1).",
+         "arguments": [{"name": "options", "description": "optional: workers", "required": false}]},
+    ])
+}
+
+/// The instructions behind /mcp__doctest__<name>: the whole workflow, so a person only types the command.
+pub fn prompt_text(name: &str, words: &[String]) -> Option<String> {
+    let workers: usize = words.iter().find_map(|w| w.parse().ok()).unwrap_or(1).clamp(1, 16);
+    let redo = name == "all" && words.iter().any(|w| w.eq_ignore_ascii_case("redo"));
+    let base = if name == "branch" {
+        words
+            .iter()
+            .find(|w| w.parse::<usize>().is_err() && !w.eq_ignore_ascii_case("redo"))
+            .cloned()
+    } else {
+        None
+    };
+    let (what, args) = match name {
+        "all" => (
+            "the whole application",
+            format!("\"scope\": \"all\"{}", if redo { ", \"redo\": true" } else { "" }),
+        ),
+        "branch" => (
+            "what this git branch changed",
+            format!(
+                "\"scope\": \"branch\"{}",
+                base.as_ref()
+                    .map(|b| format!(", \"base\": \"{b}\""))
+                    .unwrap_or_default()
+            ),
+        ),
+        "changes" => (
+            "what changed since the last finished doctest run",
+            "\"scope\": \"changes\"".to_string(),
+        ),
+        _ => return None,
+    };
+    let scope_word = match name {
+        "all" => "all",
+        "branch" => "branch",
+        _ => "changes",
+    };
+    let work = if workers == 1 {
+        format!(
+            "Use 1 worker (you): call claim with {{\"worker\": \"w1\", \"count\": 5, {args}}}, work every item it gives you, and claim again until no items are left."
+        )
+    } else {
+        format!(
+            "Use {workers} workers: start {workers} subagents at the same time, named w1 … w{workers}, each with the item rules below. Each calls claim with {{\"worker\": \"<its name>\", \"count\": 5, {args}}}, works its items, and claims again until none are left. Wait for all of them before step 4."
+        )
+    };
+    Some(format!(
+        "Document and test {what} with doctest (scope \"{scope_word}\"{redo_note}). Keep going without asking me unless you are blocked.
+
+1. Call the doctor tool. If there is no .doctest.toml, run `doctest init` in the Laravel repo, then fill its TODO lines from the project itself (codemap: the login page and its fields, locale files, menu file, portals from route-name prefixes, the test command and container, the app's local URL). Ask me only for the test login (DOCTEST_USER / DOCTEST_PASSWORD) when screenshots need it and it is not set.
+2. Call status with {{{args}}} and tell me the counts and the progress percentages.
+3. {work}
+   Item rules — for every item call facts first, then:
+   - guide:… / translation:… — take every screenshot in facts.screenshot_plan with shoot (masks hide real data), then write_doc. The primary language first, then translations.
+   - process:… — write_doc for the process across the pages it covers.
+   - doc:… — write_doc from the facts (the start page is for a real server, not localhost).
+   - shot:… — shoot it again with its stored spec (fix selectors if the page changed).
+   - tests:… — cases, then write_test: one method with a data provider per target, a row per missing case; remove the obsolete rows it lists.
+   When write_doc or write_test refuses, fix what it says and send it again; never invent a field, button, endpoint or message.
+4. Call issues (same scope), then check, then build.
+5. Call finish and report: the time it took (finish says), guides, screenshots and translations written, test rows written, removed or kept as bugs, the code points from issues, any problem reports (ids), and the path of document/guide/index.html.",
+        redo_note = if redo { ", rewriting every guide" } else { "" }
+    ))
+}
+
 /// A plan with the project's workers (each with its own codemap client), merged into the saved state.
 fn run_plan(
     factory: &Factory,
@@ -520,7 +629,12 @@ fn run_plan(
         )
     };
     let plan = work::plan_parallel(&p.cfg, &mut *p.api, st, scope, progress, Some(&make))?;
-    State::update(&p.cfg, |s| s.merge_plan(st))?;
+    State::update(&p.cfg, |s| {
+        s.merge_plan(st);
+        if s.run_started.is_none() {
+            s.run_started = Some(crate::state::now());
+        }
+    })?;
     Ok(plan)
 }
 
@@ -1847,6 +1961,96 @@ mod tests {
         for want in ["codemap", "git", "config", "chrome", "test login"] {
             assert!(text.to_lowercase().contains(want), "{want} missing from {text}");
         }
+    }
+
+    fn get_prompt(s: &mut Server, name: &str, args: Value) -> String {
+        let r = s.handle(&json!({"jsonrpc": "2.0", "id": 9, "method": "prompts/get", "params": {"name": name, "arguments": args}})).unwrap();
+        r["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{r}"))
+            .to_string()
+    }
+
+    #[test]
+    fn prompts_are_offered_as_commands() {
+        let mut s = server();
+        let init = s
+            .handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+            .unwrap();
+        assert!(init["result"]["capabilities"]["prompts"].is_object());
+        let list = s
+            .handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "prompts/list"}))
+            .unwrap();
+        let names: Vec<&str> = list["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["all", "branch", "changes"]);
+        let all = get_prompt(&mut s, "all", json!({}));
+        for want in [
+            "scope \"all\"",
+            "1 worker",
+            "facts",
+            "screenshot_plan",
+            "write_test",
+            "finish",
+        ] {
+            assert!(all.contains(want), "{want} missing from the all prompt:\n{all}");
+        }
+        assert!(!all.contains("redo"), "redo only when asked");
+        let redo = get_prompt(&mut s, "all", json!({"redo": "redo", "workers": "4"}));
+        assert!(
+            redo.contains("\"redo\": true") && redo.contains("4 workers") && redo.contains("claim"),
+            "{redo}"
+        );
+        let branch = get_prompt(&mut s, "branch", json!({"base": "develop"}));
+        assert!(
+            branch.contains("scope \"branch\"") && branch.contains("\"base\": \"develop\""),
+            "{branch}"
+        );
+        let bad = s
+            .handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": {"name": "nope"}}))
+            .unwrap();
+        assert!(bad["error"].is_object());
+    }
+
+    #[test]
+    fn redo_lists_documented_pages_again() {
+        let (_d, cfg) = project();
+        let mut s = server();
+        let md =
+            "---\ntitle: New Order\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\n---\nClick **Save**.\n";
+        call(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "markdown": md}),
+        );
+        let (plain, _) = call(&mut s, "plan", json!({"project": cfg.root, "scope": "all"}));
+        assert!(!plain.contains("guide:en:shop.orders.create"), "{plain}");
+        let (redo, err) = call(
+            &mut s,
+            "plan",
+            json!({"project": cfg.root, "scope": "all", "redo": true}),
+        );
+        assert!(
+            !err && redo.contains("guide:en:shop.orders.create") && redo.contains("redo requested"),
+            "{redo}"
+        );
+    }
+
+    #[test]
+    fn finish_reports_how_long_the_run_took() {
+        let (_d, cfg) = project();
+        let mut s = server();
+        call(&mut s, "status", json!({"project": cfg.root, "scope": "all"}));
+        State::update(&cfg, |st| st.run_started = st.run_started.map(|t| t - 125)).unwrap();
+        let (text, err) = call(&mut s, "finish", json!({"project": cfg.root}));
+        assert!(!err && text.contains("took 2m 5s"), "{text}");
+        let st = State::load(&cfg);
+        assert_eq!(st.runs.last().unwrap().seconds, Some(125));
+        assert!(st.run_started.is_none());
     }
 
     #[test]

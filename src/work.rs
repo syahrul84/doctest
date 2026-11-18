@@ -837,6 +837,42 @@ pub fn plan_parallel(
     Ok(plan)
 }
 
+/// `125` → `2m 5s`.
+pub fn duration(seconds: u64) -> String {
+    let (h, m, s) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    match (h, m) {
+        (0, 0) => format!("{s}s"),
+        (0, _) => format!("{m}m {s}s"),
+        _ => format!("{h}h {m}m"),
+    }
+}
+
+/// Redo: every page guide (and its screenshots) is listed again, even when it is up to date.
+pub fn add_redo(plan: &mut Plan, cfg: &Config, state: &State) {
+    let primary = cfg.primary_language();
+    for p in &plan.pages {
+        let id = format!("guide:{primary}:{}", p.key);
+        if !plan.items.iter().any(|i| i.id == id) {
+            plan.items.push(WorkItem {
+                id,
+                kind: ItemKind::Guide,
+                reason: "redo requested: rewrite it and retake its screenshots".into(),
+            });
+        }
+        for shot in state.pages.get(&p.key).map(|s| s.shots.clone()).unwrap_or_default() {
+            let sid = format!("shot:{shot}");
+            if !plan.items.iter().any(|i| i.id == sid) {
+                plan.items.push(WorkItem {
+                    id: sid,
+                    kind: ItemKind::Shot,
+                    reason: "redo requested".into(),
+                });
+            }
+        }
+    }
+    plan.items.sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
     pub scope: String,
