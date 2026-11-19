@@ -2764,9 +2764,14 @@ mod tests {
         call(&mut s, "status", json!({"project": cfg.root, "scope": "all"}));
         State::update(&cfg, |st| st.run_started = st.run_started.map(|t| t - 125)).unwrap();
         let (text, err) = call(&mut s, "finish", json!({"project": cfg.root}));
-        assert!(!err && text.contains("took 2m 5s"), "{text}");
+        // a slow machine may tick one more second between the calls
+        assert!(
+            !err && (text.contains("took 2m 5s") || text.contains("took 2m 6s")),
+            "{text}"
+        );
         let st = State::load(&cfg);
-        assert_eq!(st.runs.last().unwrap().seconds, Some(125));
+        let secs = st.runs.last().unwrap().seconds.unwrap();
+        assert!((125..=126).contains(&secs), "{secs}");
         assert!(st.run_started.is_none());
     }
 
