@@ -119,7 +119,10 @@ blocked. A spec sets `allow_saves` to show a real save on test data (retaking it
 `[screenshots] allow` lets through requests that only read, such as a search sent as POST.
 
 Each worker has its own Chrome. If Chrome crashes or its connection drops, doctest starts a new one and tries again.
-Every Chrome doctest starts is tagged with its doctest, so Chromes left behind by a doctest that was killed are
+Each worker's browser starts from a copy of the session `doctest login` saved, so the saved one is never changed.
+If the app drops its sign-in and goes to its sign-in page during a shot (many apps do on any 401), doctest names the
+request that was refused (or the one safe mode refused), starts that worker's browser again from the saved session and
+tries once more; the other shots are not affected. Every Chrome doctest starts is tagged with its doctest, so Chromes left behind by a doctest that was killed are
 stopped within a minute, and a doctest stops its own when the client closes. `doctest doctor` opens the app in
 headless Chrome to check it loads.
 

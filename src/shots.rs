@@ -88,6 +88,44 @@ struct Guard {
     armed: AtomicBool,
     blocked: Mutex<Vec<String>>,
     allow: Vec<String>,
+    /// Requests the app's servers answered 401 or 419 during the current shot: what makes an app drop its sign-in.
+    refused: Mutex<Vec<String>>,
+}
+
+/// Marks a shot that ended on the sign-in page, so capture can retry it in a fresh browser.
+const SIGNED_OUT: &str = "the app sent the screenshot to its sign-in page";
+
+/// Why a shot ended on the sign-in page, from the requests the app's servers refused (401/419) and the ones safe mode
+/// refused during it. Each browser starts from a copy of the saved sign-in, so the saved one is never touched.
+fn signed_out_error(user: &str, refused: &[String], blocked: &[String]) -> String {
+    let login = if user == "default" {
+        "doctest login".to_string()
+    } else {
+        format!("doctest login --user {user}")
+    };
+    let mut refused: Vec<&String> = refused.iter().collect();
+    refused.dedup();
+    if !refused.is_empty() {
+        let list: Vec<&str> = refused.iter().take(5).map(|s| s.as_str()).collect();
+        format!(
+            "{SIGNED_OUT} after the server refused the sign-in on {} — the app clears its sign-in on any 401. The saved \
+             session for {user} is still there and the other shots keep using it, so do not stop the run: this page calls \
+             an endpoint {user} may not use (an app bug, or a page of another portal), so tell the person and skip this \
+             shot. Run `{login}` only if every page fails.",
+            list.join(", ")
+        )
+    } else if !blocked.is_empty() {
+        format!(
+            "{SIGNED_OUT} after safe mode refused {} — if that is a sign-in refresh, heartbeat or search, add it to \
+             [screenshots] allow; the saved session for {user} is still there and the other shots keep using it.",
+            blocked.join(", ")
+        )
+    } else {
+        format!(
+            "{SIGNED_OUT} with no refused request seen: the saved session for {user} may have expired — run `{login}` \
+             again"
+        )
+    }
 }
 
 /// Every Chrome doctest starts carries `--doctest-owner=<pid>`, so Chromes left behind by a doctest that died can
@@ -778,6 +816,19 @@ impl Shooter {
                 allow: self.cfg.screenshots.allow.clone(),
                 ..Default::default()
             });
+            // what the servers refuse (401/419) explains a shot that ends on the sign-in page
+            let g = guard.clone();
+            tab.register_response_handling(
+                "doctest-refused",
+                Box::new(move |params, _body| {
+                    let r = &params.response;
+                    if r.status == 401 || r.status == 419 {
+                        let url = r.url.split('?').next().unwrap_or_default();
+                        g.refused.lock().expect("guard").push(format!("{} ({})", url, r.status));
+                    }
+                }),
+            )
+            .map_err(|e| format!("cannot watch responses: {e}"))?;
             if self.cfg.screenshots.safe {
                 use headless_chrome::protocol::cdp::{Fetch, Network};
                 let pattern = |t: Network::ResourceType| Fetch::RequestPattern {
@@ -846,10 +897,21 @@ impl Shooter {
         Ok(s.tab.clone())
     }
 
-    /// Takes the screenshot of a spec and writes it (lossless WebP, mode 644, at most max_width wide). When Chrome went away
-    /// (crashed, or its connection dropped) it starts a new one and tries once more.
+    /// Takes the screenshot of a spec and writes it (lossless WebP, mode 644, at most max_width wide). When Chrome went
+    /// away (crashed, or its connection dropped), or the app dropped its sign-in in this browser and went to its
+    /// sign-in page, it starts a new browser from the saved sign-in and tries once more.
     pub fn capture(&mut self, spec: &ShotSpec) -> Result<Shot, String> {
         match self.capture_once(spec) {
+            // the app dropped its sign-in in this browser: the next shot (and this retry) starts from the saved one
+            Err(e) if e.starts_with(SIGNED_OUT) => {
+                let user = spec.user.clone().unwrap_or_else(|| default_user(&self.cfg));
+                self.sessions.remove(&user);
+                let r = self.capture_once(spec);
+                if r.is_err() {
+                    self.sessions.remove(&user);
+                }
+                r
+            }
             Err(e) if dropped(&e) => {
                 let user = spec.user.clone().unwrap_or_else(|| default_user(&self.cfg));
                 self.sessions.remove(&user);
@@ -867,6 +929,7 @@ impl Shooter {
         let user_key = self.current.clone().unwrap_or_default();
         let guard = self.sessions[&user_key].guard.clone();
         guard.blocked.lock().expect("guard").clear();
+        guard.refused.lock().expect("guard").clear();
         guard
             .armed
             .store(self.cfg.screenshots.safe && !spec.allow_saves, Ordering::SeqCst);
@@ -891,22 +954,30 @@ impl Shooter {
         settle(&tab, Duration::from_secs(8));
         let user = self.current.clone().unwrap_or_default();
         let (login_url, _) = self.cfg.login_for(&user);
-        if !path.starts_with(&login_url) && on_login_page(&tab.get_url(), &login_url) {
-            return Err(format!(
-                "the app sent the screenshot to its sign-in page: the saved session for {user} has expired — run `doctest login{}` again",
-                if user == "default" {
-                    String::new()
-                } else {
-                    format!(" --user {user}")
-                }
-            ));
-        }
+        let guard = self.sessions.get(&user).map(|s| s.guard.clone());
+        let signed_out = |tab: &Arc<Tab>| -> Result<(), String> {
+            if !path.starts_with(&login_url) && on_login_page(&tab.get_url(), &login_url) {
+                let (refused, blocked) = guard
+                    .as_ref()
+                    .map(|g| {
+                        (
+                            g.refused.lock().expect("guard").clone(),
+                            g.blocked.lock().expect("guard").clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(signed_out_error(&user, &refused, &blocked));
+            }
+            Ok(())
+        };
+        signed_out(&tab)?;
         let lang = spec.lang.clone();
         let subst = move |v: &str| v.replace("$lang", &lang);
         for (i, step) in spec.steps.iter().enumerate() {
             Self::run_step(&tab, i + 1, step, &path, &subst, &base)?;
         }
         settle(&tab, Duration::from_secs(5));
+        signed_out(&tab)?;
         let masks: Vec<Mask> = self.cfg.screenshots.mask.iter().chain(&spec.mask).cloned().collect();
         let counts = tab
             .evaluate(&mask_js(&masks), false)
@@ -1107,8 +1178,13 @@ mod tests {
                         .to_string();
                     let body = std::fs::read(root.join(if path.is_empty() { "login.html" } else { &path }))
                         .unwrap_or_default();
+                    let status = if path.starts_with("api/denied") {
+                        "401 Unauthorized"
+                    } else {
+                        "200 OK"
+                    };
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = s.write_all(head.as_bytes());
@@ -1172,6 +1248,20 @@ mod tests {
         write_image(&img, &out).unwrap();
         assert_eq!(&std::fs::read(&out).unwrap()[8..12], b"WEBP");
         assert_eq!(image::open(&out).unwrap().to_rgb8(), img.to_rgb8(), "same pixels");
+    }
+
+    #[test]
+    fn a_shot_on_the_sign_in_page_says_why() {
+        let e = signed_out_error("admin", &["http://x/api/selfcare/me (401)".into()], &[]);
+        assert!(e.starts_with(SIGNED_OUT) && e.contains("api/selfcare/me (401)") && e.contains("do not stop the run"));
+        assert!(
+            !e.contains("expired"),
+            "a refused request is not an expired session: {e}"
+        );
+        let e = signed_out_error("admin", &[], &["POST /api/token/refresh".into()]);
+        assert!(e.contains("safe mode refused POST /api/token/refresh") && e.contains("[screenshots] allow"));
+        let e = signed_out_error("admin", &[], &[]);
+        assert!(e.contains("may have expired") && e.contains("doctest login --user admin"));
     }
 
     #[test]
@@ -1258,6 +1348,23 @@ mod tests {
             .filter(|(_, o)| *o == std::process::id())
             .count();
         assert_eq!(n, 0, "Chrome left running after the shooter closed");
+    }
+
+    #[test]
+    #[ignore = "needs Chrome"]
+    fn a_page_that_drops_the_sign_in_does_not_break_later_shots() {
+        let port = serve();
+        let d = tempfile::tempdir().unwrap();
+        let cfg = live_cfg(d.path(), port);
+        let mut sh = Shooter::start(&cfg).unwrap();
+        sh.capture(&spec("/orders.html")).unwrap();
+        let e = sh.capture(&spec("/denied.html")).unwrap_err();
+        assert!(e.starts_with(SIGNED_OUT) && e.contains("/api/denied (401)"), "{e}");
+        assert!(e.contains("do not stop the run"), "{e}");
+        // the next shot starts from the sign-in again instead of the browser the app signed out
+        sh.capture(&spec("/orders.html")).unwrap();
+        let text = sh.page_text().unwrap();
+        assert!(text.contains("demo") && !text.contains("nobody"), "{text}");
     }
 
     #[test]

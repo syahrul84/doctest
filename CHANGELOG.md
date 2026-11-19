@@ -6,6 +6,12 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- A shot that lands on the sign-in page no longer says "session expired" when it is not: it names the request the
+  server refused (401/419) or safe mode refused, and the worker's browser starts again from the saved session, so
+  later shots keep working (before, every later shot of that worker failed).
+- Calls to another portal's API reached through shared code (an admin layout reaching selfcare endpoints) are not
+  the page's actions.
+
 - A page's actions come only from its own components; actions reached through shared screens, layouts or API
   modules are listed as possible and are not required unless the page shows the button.
 - Fewer required screenshots: the page, one form shot for Add and Edit, one per other action; `<!-- no-data -->`

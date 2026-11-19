@@ -466,6 +466,14 @@ impl<'a> FactBuilder<'a> {
                 }
             }
         }
+        // shared code (a layout, a shell) can reach another portal's API: those calls are not this page's
+        let others: Vec<String> = self
+            .portals
+            .iter()
+            .map(|p| p.name.to_lowercase())
+            .filter(|n| !page.portal.is_empty() && *n != page.portal.to_lowercase() && n != "public")
+            .collect();
+        endpoints.retain(|e| !(e.possible && of_other_portal(&e.uri, &others)));
         // a page in several menus belongs to the one whose permission its endpoints check
         let mut page = page.clone();
         if let Some(r) = page.route_name.as_deref() {
@@ -828,6 +836,13 @@ fn reads_as_success(m: &str) -> bool {
         && !["fail", "cannot", "can't", "unable", "error", "not "]
             .iter()
             .any(|w| l.contains(w))
+}
+
+/// Does this API path belong to one of these other portals (a path segment named after it, like api/selfcare/…)?
+pub fn of_other_portal(uri: &str, others: &[String]) -> bool {
+    uri.to_lowercase()
+        .split(['/', '.', '-', '_'])
+        .any(|seg| others.iter().any(|o| o == seg))
 }
 
 /// A layout: a component that renders the routed page inside it.
@@ -1849,6 +1864,15 @@ const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 
         assert!(!carries_over(Some("abc"), "def"));
         assert!(!carries_over(Some(&fp), &fp));
         assert!(!carries_over(None, "abc"));
+    }
+
+    #[test]
+    fn another_portals_api_is_not_the_pages() {
+        let others = vec!["selfcare".to_string(), "contractor".to_string()];
+        assert!(of_other_portal("api/selfcare/profile/{projectId}", &others));
+        assert!(of_other_portal("api/v1/contractor-jobs", &others));
+        assert!(!of_other_portal("api/admin/orders", &others));
+        assert!(!of_other_portal("api/selfcareless", &others), "whole segments only");
     }
 
     #[test]
