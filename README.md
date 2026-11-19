@@ -124,8 +124,9 @@ stopped within a minute, and a doctest stops its own when the client closes. `do
 headless Chrome to check it loads.
 
 Translations reuse the primary language's screenshots. With `per_language = true` the AI retakes a page's stored
-screenshots in another language with one call (`shoot {retake_page, lang}`). Screenshots are written as compact PNGs;
-`doctest shrink` re-encodes existing ones (about 30% smaller, same pixels).
+screenshots in another language with one call (`shoot {retake_page, lang}`). Screenshots are written as lossless WebP
+(`guide/img/<lang>/<id>.webp`): the same pixels as a PNG, about 70% smaller. `doctest shrink` converts existing PNG
+screenshots to WebP, removes the PNGs and points the guides at the new files; run `doctest build` afterwards.
 
 A guide needs the page, one form shot for Add and Edit, and one shot per other action; more only where they help.
 If a page has no records to show, put `<!-- no-data: why -->` in the guide and only what works without records is

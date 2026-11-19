@@ -211,8 +211,13 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             continue;
         }
         if &cap[1] == "!" {
-            if !cfg.out.join(path).is_file() {
-                out.push(Problem::error(format!("image {target} does not exist (images live under the document folder, e.g. guide/img/<lang>/<id>.png)")));
+            let webp = path.strip_suffix(".png").map(|p| format!("{p}.webp"));
+            if let Some(w) = webp.filter(|w| !cfg.out.join(path).is_file() && cfg.out.join(w).is_file()) {
+                out.push(Problem::error(format!(
+                    "image {target}: screenshots are WebP now; use {w} (`doctest shrink` updates every guide)"
+                )));
+            } else if !cfg.out.join(path).is_file() {
+                out.push(Problem::error(format!("image {target} does not exist (images live under the document folder, e.g. guide/img/<lang>/<id>.webp)")));
             }
         } else if path.ends_with(".md") {
             let resolved = normalize(&dir.join(path));

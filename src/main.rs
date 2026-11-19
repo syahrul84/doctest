@@ -306,18 +306,25 @@ fn main() -> ExitCode {
         Command::Check { project } => check_cmd(&project),
         Command::Build { project } => build_cmd(&project).map(|t| (t, true)),
         Command::Shrink { project } => load(&project).and_then(|cfg| {
-            let (n, before, after) = shots::shrink_all(&cfg)?;
+            let shots::Shrunk {
+                files: n,
+                before,
+                after,
+                guides,
+            } = shots::shrink_all(&cfg)?;
             let mb = |b: u64| b as f64 / 1_048_576.0;
             Ok((
                 format!(
-                    "{n} screenshot(s): {:.1} MB -> {:.1} MB ({:.0}% smaller)",
+                    "{n} screenshot(s) as WebP: {:.1} MB -> {:.1} MB ({:.0}% smaller); {guides} guide(s) now point at the \
+                     .webp files{}",
                     mb(before),
                     mb(after),
                     if before == 0 {
                         0.0
                     } else {
                         100.0 - after as f64 * 100.0 / before as f64
-                    }
+                    },
+                    if guides > 0 { " — run `doctest build` to update the HTML" } else { "" }
                 ),
                 true,
             ))

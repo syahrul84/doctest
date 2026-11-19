@@ -27,8 +27,9 @@ Fixes from the first long run on a real project:
   controllers, the tables of their models, the jobs they dispatch and the menu permissions; the server block is only
   in the start page, configuration and architecture facts.
 - Translations reuse the primary language's screenshots (`[screenshots] per_language = true` retakes them per
-  language from the stored specs in one call); screenshots are saved as compact RGB PNGs and `doctest shrink`
-  re-encodes existing ones (about 30% smaller on a real project).
+  language from the stored specs in one call); screenshots are saved as lossless WebP (same pixels, about 70%
+  smaller than PNG on a real project) and `doctest shrink` converts existing PNGs and updates the guides that
+  reference them.
 
 - MCP server and CLI for Laravel + Vue 2/3 projects, built on codemap.
 - User guide per page and per language, one guide per portal, checked against the real screen (labels, buttons,

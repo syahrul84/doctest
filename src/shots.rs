@@ -18,7 +18,7 @@ use crate::config::{Config, Mask, Step};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShotSpec {
-    /// `<module>/<page-slug>-<n>`; the file is guide/img/<lang>/<id>.png.
+    /// `<module>/<page-slug>-<n>`; the file is guide/img/<lang>/<id>.webp.
     pub id: String,
     /// Page key the image belongs to.
     pub page: String,
@@ -244,7 +244,7 @@ pub fn resolve_path(s: &ShotSpec) -> Result<String, String> {
 
 /// Document-relative path used in guide sources.
 pub fn image_ref(s: &ShotSpec) -> String {
-    format!("guide/img/{}/{}.png", s.lang, s.id)
+    format!("guide/img/{}/{}.webp", s.lang, s.id)
 }
 
 pub fn image_path(cfg: &Config, s: &ShotSpec) -> PathBuf {
@@ -404,39 +404,49 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     Ok(user.to_string())
 }
 
-/// Writes a screenshot as a small PNG: no alpha channel (screens are opaque) and the best compression.
-pub fn write_png(img: &image::DynamicImage, out: &Path) -> Result<(), String> {
-    use image::ImageEncoder;
-    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+/// Writes a screenshot as lossless WebP (libwebp): the same pixels as the PNG Chrome returns, at about a third of
+/// the size of an optimised PNG. No alpha channel (screens are opaque).
+pub fn write_image(img: &image::DynamicImage, out: &Path) -> Result<(), String> {
     let rgb = img.to_rgb8();
-    let mut buf = Vec::new();
-    PngEncoder::new_with_quality(&mut buf, CompressionType::Best, FilterType::Adaptive)
-        .write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
-        .map_err(|e| format!("cannot encode {}: {e}", out.display()))?;
-    let tmp = out.with_extension("png.tmp");
-    std::fs::write(&tmp, &buf).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    let buf = webp::Encoder::from_rgb(rgb.as_raw(), rgb.width(), rgb.height()).encode_lossless();
+    let tmp = out.with_extension("webp.tmp");
+    std::fs::write(&tmp, &*buf).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     std::fs::rename(&tmp, out).map_err(|e| format!("cannot write {}: {e}", out.display()))
 }
 
-/// `doctest shrink`: re-encodes every screenshot under guide/img (smaller, same pixels; wider than max_width ones
-/// scaled down). Returns (files, bytes before, bytes after).
-pub fn shrink_all(cfg: &Config) -> Result<(usize, u64, u64), String> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+/// `doctest shrink`: re-encodes every screenshot under guide/img as lossless WebP (same pixels, wider than max_width
+/// ones scaled down), removes the PNGs it replaced and points the guide sources at the new files.
+pub struct Shrunk {
+    pub files: usize,
+    pub before: u64,
+    pub after: u64,
+    pub guides: usize,
+}
+
+pub fn shrink_all(cfg: &Config) -> Result<Shrunk, String> {
+    fn walk(dir: &Path, ext: &[&str], out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
             if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "png") {
+                walk(&p, ext, out);
+            } else if p.extension().is_some_and(|x| ext.iter().any(|e| x == *e)) {
                 out.push(p);
             }
         }
     }
     let mut files = Vec::new();
-    walk(&cfg.out.join("guide/img"), &mut files);
+    walk(&cfg.out.join("guide/img"), &["png", "webp"], &mut files);
     let (mut before, mut after) = (0u64, 0u64);
     for f in &files {
         let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
         before += size;
+        let webp = f.with_extension("webp");
+        let is_png = f.extension().is_some_and(|x| x == "png");
+        if is_png && webp.is_file() {
+            // a newer WebP of the same shot is already there
+            std::fs::remove_file(f).map_err(|e| e.to_string())?;
+            continue;
+        }
         let mut img = image::open(f).map_err(|e| format!("{}: {e}", f.display()))?;
         let max = cfg.screenshots.max_width;
         if img.width() > max {
@@ -444,17 +454,45 @@ pub fn shrink_all(cfg: &Config) -> Result<(usize, u64, u64), String> {
             img = img.resize(max, h.max(1), image::imageops::FilterType::Lanczos3);
         }
         let tmp = f.with_extension("shrunk");
-        write_png(&img, &tmp)?;
+        write_image(&img, &tmp)?;
         let new = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(u64::MAX);
-        if new < size {
-            std::fs::rename(&tmp, f).map_err(|e| e.to_string())?;
+        if is_png || new < size {
+            std::fs::rename(&tmp, &webp).map_err(|e| e.to_string())?;
+            if is_png {
+                std::fs::remove_file(f).map_err(|e| e.to_string())?;
+            }
             after += new;
         } else {
             let _ = std::fs::remove_file(&tmp);
             after += size;
         }
     }
-    Ok((files.len(), before, after))
+    let png_ref = regex::Regex::new(r"(guide/img/[^)\s]+)\.png\)").unwrap();
+    let mut sources = Vec::new();
+    walk(&crate::source::source_root(cfg), &["md"], &mut sources);
+    let mut guides = 0;
+    for p in sources {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let new = png_ref.replace_all(&text, |c: &regex::Captures| {
+            if cfg.out.join(format!("{}.webp", &c[1])).is_file() {
+                format!("{}.webp)", &c[1])
+            } else {
+                c[0].to_string()
+            }
+        });
+        if new != text {
+            std::fs::write(&p, new.as_bytes()).map_err(|e| format!("cannot write {}: {e}", p.display()))?;
+            guides += 1;
+        }
+    }
+    Ok(Shrunk {
+        files: files.len(),
+        before,
+        after,
+        guides,
+    })
 }
 
 /// `doctor`: opens the app's first page in headless Chrome, as screenshots will. Returns the URL it ended on and
@@ -808,7 +846,7 @@ impl Shooter {
         Ok(s.tab.clone())
     }
 
-    /// Takes the screenshot of a spec and writes it (PNG, mode 644, at most max_width wide). When Chrome went away
+    /// Takes the screenshot of a spec and writes it (lossless WebP, mode 644, at most max_width wide). When Chrome went away
     /// (crashed, or its connection dropped) it starts a new one and tries once more.
     pub fn capture(&mut self, spec: &ShotSpec) -> Result<Shot, String> {
         match self.capture_once(spec) {
@@ -915,7 +953,7 @@ impl Shooter {
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        write_png(&img, &out)?;
+        write_image(&img, &out)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -997,9 +1035,9 @@ mod tests {
         s.lang = "id".into();
         assert_eq!(
             image_path(&cfg, &s),
-            cfg.out.join("guide/img/id/orders/shop-orders-create-1.png")
+            cfg.out.join("guide/img/id/orders/shop-orders-create-1.webp")
         );
-        assert_eq!(image_ref(&s), "guide/img/id/orders/shop-orders-create-1.png");
+        assert_eq!(image_ref(&s), "guide/img/id/orders/shop-orders-create-1.webp");
     }
 
     #[test]
@@ -1106,12 +1144,34 @@ mod tests {
         });
         let f = dir.join("p-1.png");
         img.save_with_format(&f, image::ImageFormat::Png).unwrap();
-        let (n, before, after) = shrink_all(&cfg).unwrap();
-        assert_eq!(n, 1);
-        assert!(after < before, "{before} -> {after}");
-        let back = image::open(&f).unwrap();
+        let src = crate::source::source_root(&cfg).join("guide/en/m");
+        std::fs::create_dir_all(&src).unwrap();
+        let guide = src.join("p.md");
+        std::fs::write(&guide, "![a](guide/img/en/m/p-1.png) ![b](guide/img/en/m/gone-2.png)\n").unwrap();
+        let r = shrink_all(&cfg).unwrap();
+        assert_eq!((r.files, r.guides), (1, 1));
+        assert!(r.after < r.before, "{} -> {}", r.before, r.after);
+        assert!(!f.exists(), "the PNG is replaced");
+        let back = image::open(dir.join("p-1.webp")).unwrap();
         assert_eq!(back.width(), 100);
         assert!(back.color() == image::ColorType::Rgb8);
+        assert_eq!(
+            std::fs::read_to_string(&guide).unwrap(),
+            "![a](guide/img/en/m/p-1.webp) ![b](guide/img/en/m/gone-2.png)\n",
+            "only references whose WebP exists change"
+        );
+    }
+
+    #[test]
+    fn screenshots_are_lossless_webp() {
+        let d = tempfile::tempdir().unwrap();
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 40, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 6) as u8, ((x + y) % 256) as u8])
+        }));
+        let out = d.path().join("s.webp");
+        write_image(&img, &out).unwrap();
+        assert_eq!(&std::fs::read(&out).unwrap()[8..12], b"WEBP");
+        assert_eq!(image::open(&out).unwrap().to_rgb8(), img.to_rgb8(), "same pixels");
     }
 
     #[test]

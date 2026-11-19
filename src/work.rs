@@ -521,12 +521,16 @@ pub fn plan_parallel(
             });
         }
     }
-    let img = regex::Regex::new(r"!\[[^\]]*\]\((guide/img/([^/)]+)/([^)\s]+)\.png)\)").unwrap();
+    let img = regex::Regex::new(r"!\[[^\]]*\]\((guide/img/([^/)]+)/([^)\s]+)\.(?:png|webp))\)").unwrap();
     for s in &sources {
         for c in img.captures_iter(&s.body) {
             let lang = &c[2];
             let id = &c[3];
-            if !cfg.out.join(&c[1]).is_file() && !plan.items.iter().any(|i| i.id == format!("shot:{id}")) {
+            let file = cfg.out.join(&c[1]);
+            if !file.is_file()
+                && !file.with_extension("webp").is_file()
+                && !plan.items.iter().any(|i| i.id == format!("shot:{id}"))
+            {
                 let known = state.shots.contains_key(id);
                 plan.items.push(WorkItem {
                     id: format!("shot:{id}"),
