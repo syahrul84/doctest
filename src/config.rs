@@ -111,6 +111,8 @@ pub struct ShotConfig {
     pub safe: bool,
     /// Requests allowed in safe mode, e.g. `POST /api/*/search` (method optional; `*` matches any part).
     pub allow: Vec<String>,
+    /// Retake screenshots in every language (default off: translations reuse the primary language's images).
+    pub per_language: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +200,7 @@ struct RawShots {
     safe: Option<bool>,
     #[serde(default)]
     allow: Vec<String>,
+    per_language: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -316,6 +319,7 @@ impl Config {
                 mask: raw.screenshots.mask,
                 safe: raw.screenshots.safe.unwrap_or(true),
                 allow: raw.screenshots.allow,
+                per_language: raw.screenshots.per_language.unwrap_or(false),
             },
             tests: TestConfig {
                 run,

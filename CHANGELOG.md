@@ -26,6 +26,9 @@ Fixes from the first long run on a real project:
 - System document: module facts list the endpoints the module's pages call (controller, permissions, fields), the
   controllers, the tables of their models, the jobs they dispatch and the menu permissions; the server block is only
   in the start page, configuration and architecture facts.
+- Translations reuse the primary language's screenshots (`[screenshots] per_language = true` retakes them per
+  language from the stored specs in one call); screenshots are saved as compact RGB PNGs and `doctest shrink`
+  re-encodes existing ones (about 30% smaller on a real project).
 
 - MCP server and CLI for Laravel + Vue 2/3 projects, built on codemap.
 - User guide per page and per language, one guide per portal, checked against the real screen (labels, buttons,

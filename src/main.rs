@@ -71,6 +71,11 @@ enum Command {
         #[arg(long, default_value = ".")]
         project: PathBuf,
     },
+    /// Re-encode the guide's screenshots smaller (same pixels; wider than max_width ones scaled down)
+    Shrink {
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+    },
     /// Validate the current changes: affected tests, doctest tests, stale guides, missing cases, code problems
     Verify {
         #[arg(long, default_value = ".")]
@@ -300,6 +305,23 @@ fn main() -> ExitCode {
         } => status_cmd(&project, &scope, base.as_deref(), limit).map(|t| (t, true)),
         Command::Check { project } => check_cmd(&project),
         Command::Build { project } => build_cmd(&project).map(|t| (t, true)),
+        Command::Shrink { project } => load(&project).and_then(|cfg| {
+            let (n, before, after) = shots::shrink_all(&cfg)?;
+            let mb = |b: u64| b as f64 / 1_048_576.0;
+            Ok((
+                format!(
+                    "{n} screenshot(s): {:.1} MB -> {:.1} MB ({:.0}% smaller)",
+                    mb(before),
+                    mb(after),
+                    if before == 0 {
+                        0.0
+                    } else {
+                        100.0 - after as f64 * 100.0 / before as f64
+                    }
+                ),
+                true,
+            ))
+        }),
         Command::Verify { project, scope, base } => verify_cmd(&project, &scope, base.as_deref()),
         Command::Reports { send, clear, json } => {
             if let Some(id) = send {

@@ -404,6 +404,59 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     Ok(user.to_string())
 }
 
+/// Writes a screenshot as a small PNG: no alpha channel (screens are opaque) and the best compression.
+pub fn write_png(img: &image::DynamicImage, out: &Path) -> Result<(), String> {
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let rgb = img.to_rgb8();
+    let mut buf = Vec::new();
+    PngEncoder::new_with_quality(&mut buf, CompressionType::Best, FilterType::Adaptive)
+        .write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+        .map_err(|e| format!("cannot encode {}: {e}", out.display()))?;
+    let tmp = out.with_extension("png.tmp");
+    std::fs::write(&tmp, &buf).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    std::fs::rename(&tmp, out).map_err(|e| format!("cannot write {}: {e}", out.display()))
+}
+
+/// `doctest shrink`: re-encodes every screenshot under guide/img (smaller, same pixels; wider than max_width ones
+/// scaled down). Returns (files, bytes before, bytes after).
+pub fn shrink_all(cfg: &Config) -> Result<(usize, u64, u64), String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "png") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&cfg.out.join("guide/img"), &mut files);
+    let (mut before, mut after) = (0u64, 0u64);
+    for f in &files {
+        let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        before += size;
+        let mut img = image::open(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let max = cfg.screenshots.max_width;
+        if img.width() > max {
+            let h = (img.height() as u64 * max as u64 / img.width() as u64) as u32;
+            img = img.resize(max, h.max(1), image::imageops::FilterType::Lanczos3);
+        }
+        let tmp = f.with_extension("shrunk");
+        write_png(&img, &tmp)?;
+        let new = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(u64::MAX);
+        if new < size {
+            std::fs::rename(&tmp, f).map_err(|e| e.to_string())?;
+            after += new;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            after += size;
+        }
+    }
+    Ok((files.len(), before, after))
+}
+
 /// `doctor`: opens the app's first page in headless Chrome, as screenshots will. Returns the URL it ended on and
 /// how long it took.
 pub fn probe(cfg: &Config) -> Result<(String, f64), String> {
@@ -862,8 +915,7 @@ impl Shooter {
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        img.save_with_format(&out, image::ImageFormat::Png)
-            .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+        write_png(&img, &out)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1041,6 +1093,25 @@ mod tests {
                 "[app]\nbase_url=\"http://127.0.0.1:{port}\"\nlogin_url=\"/login.html\"\nlogin_steps=[{{fill=\"[name=username]\",value=\"$user\"}},{{fill=\"[name=password]\",value=\"$password\"}},{{click=\"button[type=submit]\"}},{{wait=\".admin-layout\"}}]\n[app.users.admin]\nuser_env=\"DOCTEST_TEST_USER\"\npassword_env=\"DOCTEST_TEST_PASSWORD\"\n[screenshots]\nmax_width=800\nmask=[{{selector=\".customer-name\",text=\"Demo Tenant\"}},{{regex=\"[A-Z]{{2}}-\\\\d{{2}}-\\\\d{{2}}\",text=\"D-01-01\"}}]\n"
             ),
         )
+    }
+
+    #[test]
+    fn shrink_makes_screenshots_smaller() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = cfg_in(d.path(), "[screenshots]\nmax_width=100\n");
+        let dir = cfg.out.join("guide/img/en/m");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = image::RgbaImage::from_fn(300, 120, |x, y| {
+            image::Rgba([(x % 7 * 30) as u8, (y % 5 * 40) as u8, 200, 255])
+        });
+        let f = dir.join("p-1.png");
+        img.save_with_format(&f, image::ImageFormat::Png).unwrap();
+        let (n, before, after) = shrink_all(&cfg).unwrap();
+        assert_eq!(n, 1);
+        assert!(after < before, "{before} -> {after}");
+        let back = image::open(&f).unwrap();
+        assert_eq!(back.width(), 100);
+        assert!(back.color() == image::ColorType::Rgb8);
     }
 
     #[test]

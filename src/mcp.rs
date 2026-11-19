@@ -21,7 +21,7 @@ use crate::work::{self, Scope};
 
 const SHOOT_HELP: &str = "Take (or retake) a screenshot. Send a spec {id, page, path, params, user, lang, steps, crop, mask, allow_saves}, or an id alone to retake its stored spec. Returns the image and the path to reference.\nsteps (in order): {\"fill\": \"css\", \"value\": \"text\"} clears the field then types; {\"select\": \"css\", \"value\": \"v\"}; {\"click\": \"css\"}; {\"wait\": \"css\"} waits for an element; {\"wait_text\": \"Saved\"} waits for text; {\"scroll\": \"css\" | \"top\" | \"bottom\"}; {\"goto\": \"/path\"}.\nmask (on top of [screenshots] mask; inside shadow roots too, re-applied when the page re-renders): {\"selector\": \"css\", \"text\": \"Demo\"} replaces text or input values; {\"regex\": \"[A-Z]{2}-\\\\d+\", \"text\": \"AB-1\"} a JavaScript regex ((?i) at the start ignores case); {\"hide\": \"css\"} hides elements. The reply names masks that matched nothing.\ncrop: a CSS selector to capture just that element (scrolled into view first).\nSafe mode (on unless [screenshots] safe = false): the browser refuses POST/PUT/PATCH/DELETE while shooting, so steps cannot save or delete; the reply lists what it blocked. Set allow_saves only to show a real save result, on test data; retaking that spec saves again.";
 
-pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan: the page, one form shot for Add and Edit, one per other action), then translations (translation items; same structure, labels in that language). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
+pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan: the page, one form shot for Add and Edit, one per other action), then translations (translation items; same structure, labels in that language; they reuse the primary guide's screenshots unless facts says otherwise). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.png). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
 pub type Factory = std::sync::Arc<dyn Fn(&Config, usize) -> Box<dyn CodemapApi + Send> + Send + Sync>;
@@ -110,7 +110,7 @@ pub fn tools() -> Value {
         tool(
             "shoot",
             SHOOT_HELP,
-            json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}}),
+            json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}, "retake_page": {"type": "string", "description": "with lang: retake every stored screenshot of this page in that language ([screenshots] per_language)"}, "lang": {"type": "string"}}),
             &[]
         ),
         tool(
@@ -1298,6 +1298,24 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 .iter()
                 .map(|e| json!({"endpoint": format!("{} {}", e.method, e.uri), "action": e.at, "permissions": e.permissions, "rules": e.rules, "messages": e.messages}))
                 .collect();
+            if kind == "translation" {
+                let per_language = cfg.screenshots.per_language;
+                return Ok(pretty(&json!({
+                    "item": item,
+                    "source_path": path,
+                    "page": {"key": page.key, "path": page.path, "module": page.module, "menu_path": f.menu_titles},
+                    "labels": f.labels.get(lang),
+                    "literal_texts": f.literals,
+                    "current_text": current,
+                    "primary_text": primary_text,
+                    "screenshots": if per_language {
+                        format!("this project takes screenshots per language: call shoot with {{\"retake_page\": \"{key}\", \"lang\": \"{lang}\"}} once to retake every stored screenshot of this page in {lang}, then use guide/img/{lang}/… in place of guide/img/{primary}/…")
+                    } else {
+                        format!("reuse the {primary} guide's screenshots: keep its ![…](guide/img/{primary}/…) lines as they are (translate only the alt text) and take no new ones")
+                    },
+                    "rules": "Same structure and sections as primary_text; translate the text, and write on-screen names in bold as they read in this language (from labels or literal_texts). Keep message texts exact in italics.",
+                })));
+            }
             Ok(pretty(&json!({
                 "item": item,
                 "source_path": path,
@@ -1574,7 +1592,48 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
     ))
 }
 
+/// `shoot {retake_page, lang}`: every stored screenshot of a page, retaken in another language.
+fn retake_page(p: &mut Project, page: &str, lang: &str) -> Result<Vec<Value>, String> {
+    check_lang(&p.cfg, lang)?;
+    let st = State::load(&p.cfg);
+    let primary = p.cfg.primary_language().to_string();
+    let specs: Vec<ShotSpec> = st
+        .shots
+        .values()
+        .filter(|s| s.page == page && s.lang == primary)
+        .cloned()
+        .collect();
+    if specs.is_empty() {
+        return Err(format!(
+            "no stored screenshots of {page} in {primary}: take them for the {primary} guide first"
+        ));
+    }
+    let eff = effective_cfg(p)?;
+    if p.shooter.is_none() {
+        p.shooter = Some(Shooter::start(&eff)?);
+    }
+    let mut lines = Vec::new();
+    let mut blocked = 0;
+    for mut spec in specs {
+        spec.lang = lang.to_string();
+        spec.user = shot_user(&eff, &spec);
+        let shot = p.shooter.as_mut().expect("started").capture(&spec)?;
+        blocked += shot.blocked.len();
+        lines.push(format!("- ![…]({})", crate::shots::image_ref(&spec)));
+    }
+    Ok(vec![json!({"type": "text", "text": format!(
+        "retook {} screenshot(s) of {page} in {lang}{}:\n{}",
+        lines.len(),
+        if blocked > 0 { format!(" (safe mode blocked {blocked} save request(s))") } else { String::new() },
+        lines.join("\n")
+    )})])
+}
+
 fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
+    if let Some(page) = s(args, "retake_page") {
+        let lang = s(args, "lang").ok_or("retake_page needs lang")?.to_string();
+        return retake_page(p, &page.to_string(), &lang);
+    }
     let st = State::load(&p.cfg);
     let mut notes: Vec<String> = Vec::new();
     // a spec object, the spec's fields sent flat, or an id alone (retake the stored spec)
@@ -2349,6 +2408,35 @@ mod tests {
         assert!(d["tables"].to_string().contains("\"orders\""), "{d}");
         let (index, _) = call(&mut s, "facts", json!({"project": cfg.root, "item": "doc:index"}));
         assert!(index.contains("\"server\": {"), "index keeps the server block");
+    }
+
+    #[test]
+    fn translations_reuse_the_primary_screenshots() {
+        let (_d, cfg) = project();
+        let mut s = server();
+        let md =
+            "---\ntitle: New Order\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\n---\nClick **Save**.\n";
+        call(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "markdown": md}),
+        );
+        let (text, err) = call(
+            &mut s,
+            "facts",
+            json!({"project": cfg.root, "item": "translation:id:shop.orders.create"}),
+        );
+        assert!(!err, "{text}");
+        assert!(
+            text.contains("reuse the en guide's screenshots") && !text.contains("screenshot_plan"),
+            "{text}"
+        );
+        let (e, err) = call(
+            &mut s,
+            "shoot",
+            json!({"project": cfg.root, "retake_page": "shop.orders.create", "lang": "id"}),
+        );
+        assert!(err && e.contains("no stored screenshots"), "{e}");
     }
 
     #[test]

@@ -75,6 +75,7 @@ mask = [                              # applied before every capture, inside sha
 ]
 # safe = true                         # default: the browser refuses POST/PUT/PATCH/DELETE while shooting
 allow = ["POST /api/*/search"]        # requests that only read, let through in safe mode
+# per_language = true                 # retake screenshots in every language (default: translations reuse the primary's)
 
 [tests]
 run = "docker exec shop-backend sh -c 'cd /var/www/api && php artisan test {filter}'"
@@ -121,6 +122,10 @@ Each worker has its own Chrome. If Chrome crashes or its connection drops, docte
 Every Chrome doctest starts is tagged with its doctest, so Chromes left behind by a doctest that was killed are
 stopped within a minute, and a doctest stops its own when the client closes. `doctest doctor` opens the app in
 headless Chrome to check it loads.
+
+Translations reuse the primary language's screenshots. With `per_language = true` the AI retakes a page's stored
+screenshots in another language with one call (`shoot {retake_page, lang}`). Screenshots are written as compact PNGs;
+`doctest shrink` re-encodes existing ones (about 30% smaller, same pixels).
 
 A guide needs the page, one form shot for Add and Edit, and one shot per other action; more only where they help.
 If a page has no records to show, put `<!-- no-data: why -->` in the guide and only what works without records is
@@ -189,7 +194,7 @@ client by default: on a large app (900+ screens), four clients were 2.5× slower
 call), while the single-client planner covers 165 screens in about 45 seconds. Test runs stay one at a
 time per project, because they share the test database.
 
-CLI: `doctest doctor`, `doctest reports [--send <id>]`, `doctest update [--check]`, `doctest status [--scope changes|branch|all] [--base master]`, `doctest check` (exit 1 on errors), `doctest verify` (exit 1 on failures),
+CLI: `doctest doctor`, `doctest shrink`, `doctest reports [--send <id>]`, `doctest update [--check]`, `doctest status [--scope changes|branch|all] [--base master]`, `doctest check` (exit 1 on errors), `doctest verify` (exit 1 on failures),
 `doctest build`, `doctest serve`.
 
 ## Publishing the guide
