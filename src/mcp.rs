@@ -1632,7 +1632,7 @@ fn retake_page(p: &mut Project, page: &str, lang: &str) -> Result<Vec<Value>, St
 fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
     if let Some(page) = s(args, "retake_page") {
         let lang = s(args, "lang").ok_or("retake_page needs lang")?.to_string();
-        return retake_page(p, &page.to_string(), &lang);
+        return retake_page(p, page, &lang);
     }
     let st = State::load(&p.cfg);
     let mut notes: Vec<String> = Vec::new();
