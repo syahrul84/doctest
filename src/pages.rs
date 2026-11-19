@@ -296,6 +296,12 @@ impl<'a> FactBuilder<'a> {
                 (g.include.is_empty() || crate::work::page_matches(&p.key, &p.path, &g.include))
                     && !crate::work::page_matches(&p.key, &p.path, &g.exclude)
             })
+            // a parent route whose component only holds its child pages has nothing to document or shoot
+            .filter(|p| {
+                let file = self.app_dir(&p.app).join(&p.component);
+                !(file.extension().is_some_and(|x| x == "vue")
+                    && std::fs::read_to_string(&file).is_ok_and(|t| is_container(&t)))
+            })
             .map(|mut p| {
                 p.portal = crate::portals::portal_in(&self.portals, &p.key, &p.path);
                 p
@@ -843,6 +849,33 @@ pub fn of_other_portal(uri: &str, others: &[String]) -> bool {
     uri.to_lowercase()
         .split(['/', '.', '-', '_'])
         .any(|seg| others.iter().any(|o| o == seg))
+}
+
+/// A route container: its template is only a place for child pages (`<router-view/>`, maybe inside a transition or a
+/// plain wrapper), with no text and no other component.
+pub fn is_container(vue: &str) -> bool {
+    static TAG: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"<([A-Z][A-Za-z0-9]*|[a-z][a-z0-9]*-[a-z0-9-]+)[\s/>]").unwrap());
+    const HOLDERS: [&str; 8] = [
+        "router-view",
+        "RouterView",
+        "nuxt-page",
+        "NuxtPage",
+        "transition",
+        "Transition",
+        "keep-alive",
+        "KeepAlive",
+    ];
+    let Some(start) = vue.find("<template") else {
+        return false;
+    };
+    let end = vue.rfind("</template>").unwrap_or(vue.len());
+    let template = &vue[start..end];
+    is_layout(template)
+        && template_literals(vue).is_empty()
+        && TAG
+            .captures_iter(template)
+            .all(|c| HOLDERS.contains(&&c[1]) || c[1].eq_ignore_ascii_case("component"))
 }
 
 /// A layout: a component that renders the routed page inside it.
@@ -1864,6 +1897,23 @@ const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 
         assert!(!carries_over(Some("abc"), "def"));
         assert!(!carries_over(Some(&fp), &fp));
         assert!(!carries_over(None, "abc"));
+    }
+
+    #[test]
+    fn route_containers_are_not_pages() {
+        assert!(is_container("<template><router-view /></template>"));
+        assert!(is_container(
+            "<template>\n  <div class=\"wrap\">\n    <transition name=\"fade\"><RouterView/></transition>\n  </div>\n</template>\n<script setup></script>"
+        ));
+        assert!(
+            !is_container("<template><div><h1>Assets</h1><router-view/></div></template>"),
+            "has text"
+        );
+        assert!(
+            !is_container("<template><AdminTopBar/><router-view/></template>"),
+            "has a component"
+        );
+        assert!(!is_container("<template><div>List</div></template>"), "no child pages");
     }
 
     #[test]

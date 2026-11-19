@@ -46,6 +46,8 @@ pub struct Shot {
     pub blocked: Vec<String>,
     /// Masks that matched nothing on the page.
     pub unmatched_masks: Vec<String>,
+    /// Dialogs the page opened and doctest answered (`alert "Saved" (OK)`).
+    pub dialogs: Vec<String>,
 }
 
 /// Is this request allowed in safe mode? Reads (GET, HEAD, OPTIONS) always are; others only when a pattern in
@@ -90,6 +92,8 @@ struct Guard {
     allow: Vec<String>,
     /// Requests the app's servers answered 401 or 419 during the current shot: what makes an app drop its sign-in.
     refused: Mutex<Vec<String>>,
+    /// Dialogs the page opened during the current shot (alert, confirm, "Leave site?"), answered so they cannot block.
+    dialogs: Mutex<Vec<String>>,
 }
 
 /// Marks a shot that ended on the sign-in page, so capture can retry it in a fresh browser.
@@ -361,7 +365,19 @@ pub fn copy_profile(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn launch(chrome: &Path, headless: bool, profile: Option<&Path>) -> Result<(Browser, Arc<Tab>), String> {
+/// How long one Chrome call may go unanswered before doctest gives up on it (a page stuck on a dialog or a load that
+/// never ends). The Chrome library also closes a browser that sends nothing for this long; the next shot starts a new
+/// one (see `dropped`).
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A shot that takes longer than this stops with the step it was on.
+const SHOT_LIMIT: Duration = Duration::from_secs(90);
+
+fn launch(
+    chrome: &Path,
+    headless: bool,
+    profile: Option<&Path>,
+    call_timeout: Duration,
+) -> Result<(Browser, Arc<Tab>), String> {
     let owner = std::ffi::OsStr::new(OWNER_ARG.as_str());
     let opts = LaunchOptions::default_builder()
         .path(Some(chrome.to_path_buf()))
@@ -369,7 +385,7 @@ fn launch(chrome: &Path, headless: bool, profile: Option<&Path>) -> Result<(Brow
         .headless(headless)
         .window_size(Some((1440, 900)))
         .user_data_dir(profile.map(Path::to_path_buf))
-        .idle_browser_timeout(Duration::from_secs(900))
+        .idle_browser_timeout(call_timeout)
         .build()
         .map_err(|e| format!("cannot start Chrome: {e}"))?;
     let browser = Browser::new(opts).map_err(|e| format!("cannot start Chrome: {e}"))?;
@@ -401,7 +417,8 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     let profile = profile_dir(cfg, user);
     std::fs::create_dir_all(&profile).map_err(|e| format!("cannot create {}: {e}", profile.display()))?;
     let _ = std::fs::remove_file(profile.join(SIGNED_IN));
-    let (browser, tab) = launch(&chrome, headless, Some(&profile))?;
+    // a person signs in by hand and doctest sends Chrome nothing meanwhile: keep the connection for the whole wait
+    let (browser, tab) = launch(&chrome, headless, Some(&profile), Duration::from_secs(900))?;
     let start = format!("{}{}", cfg.app.base_url, login_url);
     tab.navigate_to(&start)
         .and_then(|t| t.wait_until_navigated())
@@ -440,6 +457,35 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     drop(browser);
     std::fs::write(profile.join(SIGNED_IN), chrono::Utc::now().to_rfc3339()).map_err(|e| e.to_string())?;
     Ok(user.to_string())
+}
+
+/// Cuts an element's box (viewport CSS pixels and the device pixel ratio: [left, top, width, height, ratio]) out of a
+/// viewport screenshot; the part outside the screen is left out.
+fn crop_png(png: &[u8], rect: &[f64]) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(png).map_err(|e| e.to_string())?;
+    let [l, t, w, h, ratio] = <[f64; 5]>::try_from(rect).map_err(|_| "bad element box".to_string())?;
+    let (iw, ih) = (img.width() as f64, img.height() as f64);
+    let x0 = (l * ratio).max(0.0).min(iw);
+    let y0 = (t * ratio).max(0.0).min(ih);
+    let x1 = ((l + w) * ratio).max(0.0).min(iw);
+    let y1 = ((t + h) * ratio).max(0.0).min(ih);
+    if x1 - x0 < 2.0 || y1 - y0 < 2.0 {
+        return Err("the element has no visible area on the screen".into());
+    }
+    let part = img.crop_imm(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+    let mut out = std::io::Cursor::new(Vec::new());
+    part.write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
+}
+
+/// One colour all over (a page that had not drawn, or a crop of nothing).
+fn is_blank(img: &image::DynamicImage) -> bool {
+    let rgb = img.to_rgb8();
+    let mut px = rgb.pixels();
+    let Some(first) = px.next() else { return true };
+    let close = |a: u8, b: u8| a.abs_diff(b) <= 3;
+    px.step_by(7).all(|p| (0..3).all(|c| close(p[c], first[c])))
 }
 
 /// Writes a screenshot as lossless WebP (libwebp): the same pixels as the PNG Chrome returns, at about a third of
@@ -538,7 +584,7 @@ pub fn shrink_all(cfg: &Config) -> Result<Shrunk, String> {
 pub fn probe(cfg: &Config) -> Result<(String, f64), String> {
     let chrome = chrome_path().ok_or("Chrome not found; install Google Chrome or set CHROME_PATH")?;
     let started = std::time::Instant::now();
-    let (_browser, tab) = launch(&chrome, true, None)?;
+    let (_browser, tab) = launch(&chrome, true, None, CALL_TIMEOUT)?;
     let (login, _) = cfg.login_for(&default_user(cfg));
     let url = format!(
         "{}{}",
@@ -565,6 +611,8 @@ pub struct Shooter {
     chrome: PathBuf,
     sessions: BTreeMap<String, Session>,
     current: Option<String>,
+    /// When the shot being taken must stop (SHOT_LIMIT after it started).
+    deadline: Option<std::time::Instant>,
 }
 
 fn mask_js(masks: &[Mask]) -> String {
@@ -658,6 +706,7 @@ impl Shooter {
             chrome,
             sessions: BTreeMap::new(),
             current: None,
+            deadline: None,
         })
     }
 
@@ -788,7 +837,7 @@ impl Shooter {
             } else {
                 None
             };
-            let (browser, tab) = launch(&self.chrome, true, copy.as_ref().map(|d| d.path()))?;
+            let (browser, tab) = launch(&self.chrome, true, copy.as_ref().map(|d| d.path()), CALL_TIMEOUT)?;
             let has_creds = self.cfg.creds_user(&user).is_some();
             if !saved && !login.is_empty() && !has_creds {
                 return Err(format!(
@@ -816,6 +865,28 @@ impl Shooter {
                 allow: self.cfg.screenshots.allow.clone(),
                 ..Default::default()
             });
+            // a dialog (alert, confirm, prompt, "Leave site?") stops the page until it is answered: answer it at once
+            // (alerts and "Leave site?" with OK, confirm and prompt with Cancel, so nothing is confirmed) and say so
+            let dialog = tab.get_dialog();
+            let g = guard.clone();
+            tab.add_event_listener(Arc::new(move |event: &headless_chrome::protocol::cdp::types::Event| {
+                use headless_chrome::protocol::cdp::Page::DialogType;
+                if let headless_chrome::protocol::cdp::types::Event::PageJavascriptDialogOpening(e) = event {
+                    let (kind, accept) = match e.params.Type {
+                        DialogType::Alert => ("alert", true),
+                        DialogType::Beforeunload => ("leave-page prompt", true),
+                        DialogType::Confirm => ("confirm", false),
+                        DialogType::Prompt => ("prompt", false),
+                    };
+                    g.dialogs.lock().expect("guard").push(format!(
+                        "{kind} {:?} ({})",
+                        e.params.message,
+                        if accept { "OK" } else { "Cancel" }
+                    ));
+                    let _ = if accept { dialog.accept(None) } else { dialog.dismiss() };
+                }
+            }))
+            .map_err(|e| format!("cannot watch dialogs: {e}"))?;
             // what the servers refuse (401/419) explains a shot that ends on the sign-in page
             let g = guard.clone();
             tab.register_response_handling(
@@ -930,17 +1001,28 @@ impl Shooter {
         let guard = self.sessions[&user_key].guard.clone();
         guard.blocked.lock().expect("guard").clear();
         guard.refused.lock().expect("guard").clear();
+        guard.dialogs.lock().expect("guard").clear();
+        self.deadline = Some(std::time::Instant::now() + SHOT_LIMIT);
         guard
             .armed
             .store(self.cfg.screenshots.safe && !spec.allow_saves, Ordering::SeqCst);
         let r = self.shoot_page(&tab, spec, &path);
         guard.armed.store(false, Ordering::SeqCst);
         let blocked = std::mem::take(&mut *guard.blocked.lock().expect("guard"));
-        let (out, unmatched_masks) = r?;
+        let dialogs = std::mem::take(&mut *guard.dialogs.lock().expect("guard"));
+        self.deadline = None;
+        let (out, unmatched_masks) = r.map_err(|e| {
+            if dialogs.is_empty() {
+                e
+            } else {
+                format!("{e} (the page opened: {})", dialogs.join("; "))
+            }
+        })?;
         Ok(Shot {
             path: out,
             blocked,
             unmatched_masks,
+            dialogs,
         })
     }
 
@@ -951,7 +1033,9 @@ impl Shooter {
         tab.navigate_to(&format!("{base}{path}"))
             .and_then(|t| t.wait_until_navigated())
             .map_err(|e| format!("cannot open {base}{path}: {e}"))?;
-        settle(&tab, Duration::from_secs(8));
+        let deadline = self.deadline.unwrap_or_else(|| std::time::Instant::now() + SHOT_LIMIT);
+        let left = |max: Duration| max.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        settle(&tab, left(Duration::from_secs(8)));
         let user = self.current.clone().unwrap_or_default();
         let (login_url, _) = self.cfg.login_for(&user);
         let guard = self.sessions.get(&user).map(|s| s.guard.clone());
@@ -974,9 +1058,17 @@ impl Shooter {
         let lang = spec.lang.clone();
         let subst = move |v: &str| v.replace("$lang", &lang);
         for (i, step) in spec.steps.iter().enumerate() {
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "the shot of {path} took over {} s and stopped before step {}: the page did not finish or a step \
+                     waits for something that never comes",
+                    SHOT_LIMIT.as_secs(),
+                    i + 1
+                ));
+            }
             Self::run_step(&tab, i + 1, step, &path, &subst, &base)?;
         }
-        settle(&tab, Duration::from_secs(5));
+        settle(&tab, left(Duration::from_secs(5)));
         signed_out(&tab)?;
         let masks: Vec<Mask> = self.cfg.screenshots.mask.iter().chain(&spec.mask).cloned().collect();
         let counts = tab
@@ -1000,21 +1092,48 @@ impl Shooter {
         std::thread::sleep(Duration::from_millis(250));
         let png = match &spec.crop {
             Some(sel) => {
-                let el = tab
-                    .wait_for_element_with_custom_timeout(sel, Duration::from_secs(10))
+                tab.wait_for_element_with_custom_timeout(sel, Duration::from_secs(10))
                     .map_err(|_| format!("crop selector {sel:?} not found on {path}"))?;
-                // below the first screen: bring it into view and let it render before capturing
-                el.scroll_into_view()
+                // below the first screen, also inside a layout's own scroll box: bring it into view, then cut its box
+                // out of what the screen shows (Chrome's element clip uses document coordinates and comes out blank
+                // for an element inside a scrolled container)
+                let js = format!(
+                    "(function(){{var e=document.querySelector({});if(!e)return null;e.scrollIntoView({{block:'center',inline:'nearest'}});return null;}})()",
+                    serde_json::to_string(sel).unwrap_or_default()
+                );
+                tab.evaluate(&js, false)
                     .map_err(|e| format!("cannot scroll to {sel:?}: {e}"))?;
-                std::thread::sleep(Duration::from_millis(400));
-                el.capture_screenshot(CaptureScreenshotFormatOption::Png)
-                    .map_err(|e| format!("screenshot failed: {e}"))?
+                std::thread::sleep(Duration::from_millis(500));
+                let rect_js = format!(
+                    "(function(){{var r=document.querySelector({}).getBoundingClientRect();return JSON.stringify([r.left,r.top,r.width,r.height,window.devicePixelRatio||1]);}})()",
+                    serde_json::to_string(sel).unwrap_or_default()
+                );
+                let rect: Vec<f64> = tab
+                    .evaluate(&rect_js, false)
+                    .ok()
+                    .and_then(|v| v.value)
+                    .and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+                    .ok_or_else(|| format!("cannot measure {sel:?}"))?;
+                let shot = tab
+                    .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
+                    .map_err(|e| format!("screenshot failed: {e}"))?;
+                crop_png(&shot, &rect).map_err(|e| format!("crop {sel:?}: {e}"))?
             }
             None => tab
                 .capture_screenshot(CaptureScreenshotFormatOption::Png, None, None, true)
                 .map_err(|e| format!("screenshot failed: {e}"))?,
         };
         let mut img = image::load_from_memory(&png).map_err(|e| format!("bad screenshot: {e}"))?;
+        if is_blank(&img) {
+            return Err(format!(
+                "the screenshot of {path}{} is blank (one colour): the content had not drawn yet or is outside the \
+                 visible area",
+                spec.crop
+                    .as_ref()
+                    .map(|c| format!(" cropped to {c:?}"))
+                    .unwrap_or_default()
+            ));
+        }
         let max = self.cfg.screenshots.max_width;
         if img.width() > max {
             let h = (img.height() as u64 * max as u64 / img.width() as u64) as u32;
@@ -1061,7 +1180,7 @@ impl Shooter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
 
@@ -1154,7 +1273,7 @@ mod tests {
     }
 
     /// Serves tests/fixtures/static-app on 127.0.0.1:<port>.
-    fn serve() -> u16 {
+    pub(crate) fn serve() -> u16 {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1348,6 +1467,49 @@ mod tests {
             .filter(|(_, o)| *o == std::process::id())
             .count();
         assert_eq!(n, 0, "Chrome left running after the shooter closed");
+    }
+
+    #[test]
+    #[ignore = "needs Chrome"]
+    fn dialogs_are_answered_crops_work_in_scroll_boxes_and_blank_shots_are_refused() {
+        let port = serve();
+        let d = tempfile::tempdir().unwrap();
+        let cfg = live_cfg(d.path(), port);
+        let mut sh = Shooter::start(&cfg).unwrap();
+        // an alert on load and a confirm from a step used to stop the page until Chrome gave up
+        let mut s = spec("/dialog.html");
+        s.steps = vec![crate::config::Step::Click { click: "#go".into() }];
+        let started = std::time::Instant::now();
+        let shot = sh.capture(&s).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(40), "{:?}", started.elapsed());
+        assert!(
+            shot.dialogs
+                .iter()
+                .any(|d| d.contains("Welcome back") && d.contains("OK")),
+            "{:?}",
+            shot.dialogs
+        );
+        assert!(
+            shot.dialogs
+                .iter()
+                .any(|d| d.contains("Delete it?") && d.contains("Cancel")),
+            "{:?}",
+            shot.dialogs
+        );
+        assert_ne!(sh.page_text().map(|_| ()).ok(), None);
+        // a section below the fold of a layout's own scroll box
+        let mut s = spec("/scrollbox.html");
+        s.id = "orders/low-1".into();
+        s.crop = Some("#low".into());
+        let out = sh.capture(&s).unwrap().path;
+        let img = image::open(&out).unwrap().to_rgb8();
+        let mid = img.get_pixel(img.width() / 4, img.height() / 2);
+        assert!(mid[0] > 150 && mid[1] < 80, "the red section, not a blank: {mid:?}");
+        // a page that drew nothing
+        let mut s = spec("/blank.html");
+        s.id = "orders/blank-1".into();
+        let e = sh.capture(&s).unwrap_err();
+        assert!(e.contains("blank"), "{e}");
     }
 
     #[test]

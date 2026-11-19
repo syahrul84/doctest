@@ -84,6 +84,8 @@ pub enum ItemKind {
     Guide,
     Translation,
     Process,
+    /// `shots:<page>`: a written guide still short of the screenshots its page needs (text first, screenshots after)
+    Shots,
     Shot,
     Doc,
     Tests,
@@ -179,6 +181,28 @@ pub fn changed_files(cfg: &Config, since: &BTreeMap<String, String>) -> Result<B
 fn is_locale(p: &Path) -> bool {
     p.components()
         .any(|c| matches!(c.as_os_str().to_str(), Some("locales" | "locale" | "lang" | "i18n")))
+}
+
+/// The languages whose guide of a page has fewer screenshots than the page needs (`en 1/3`); empty when none is short.
+pub fn shots_short(cfg: &Config, sources: &[Source], key: &str, f: &crate::pages::PageFacts) -> Vec<String> {
+    cfg.languages
+        .iter()
+        .filter_map(|lang| {
+            let g = page_guide(sources, key, lang)?;
+            let need = cfg.guide.min_screenshots.unwrap_or_else(|| {
+                crate::pages::screenshot_plan_for(&crate::pages::actions(f), crate::pages::says_no_data(&g.body)).len()
+            });
+            let have = guide_images(&g.body);
+            (have < need).then(|| format!("{lang} {have}/{need}"))
+        })
+        .collect()
+}
+
+/// How many images a guide shows.
+pub fn guide_images(body: &str) -> usize {
+    static IMG: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)\s]+\)").unwrap());
+    IMG.find_iter(body).count()
 }
 
 /// The guide source for a page in a language.
@@ -450,12 +474,11 @@ pub fn plan_parallel(
                 .cloned()
                 .filter(|_| s.fm.kind == Kind::Page)
                 .unwrap_or_else(|| source::slug(&s.fm.title));
-        let h = source::body_hash(&s.body);
         for lang in cfg.languages.iter().filter(|l| **l != primary) {
             let other = swap_lang(&s.path, lang);
             let reason = match sources.iter().find(|x| x.path == other) {
                 None => Some(format!("no {lang} translation")),
-                Some(t) if t.fm.translated_from.as_deref() != Some(h.as_str()) => {
+                Some(t) if !source::translated_from_current(t.fm.translated_from.as_deref(), &s.body) => {
                     Some(format!("the {primary} guide changed since this translation"))
                 }
                 Some(_) => None,
@@ -507,6 +530,22 @@ pub fn plan_parallel(
                 id: format!("process:{primary}:suggest"),
                 kind: ItemKind::Process,
                 reason: format!("no process guides yet; candidate menu groups: {}", big.join("; ")),
+            });
+        }
+    }
+
+    // text first: written guides still short of their screenshots (not while the guide itself is to be rewritten)
+    for page in &pages {
+        if stale_pages.contains_key(&page.key) {
+            continue;
+        }
+        let Some(f) = plan.facts.get(&page.key) else { continue };
+        let short = shots_short(cfg, &sources, &page.key, f);
+        if !short.is_empty() {
+            plan.items.push(WorkItem {
+                id: format!("shots:{}", page.key),
+                kind: ItemKind::Shots,
+                reason: format!("screenshots missing ({})", short.join(", ")),
             });
         }
     }
@@ -921,6 +960,10 @@ pub fn item_portals(plan: &Plan, state: &State, cfg: &Config) -> BTreeMap<String
                 let key = parts.nth(1).unwrap_or_default();
                 page_portal.get(key).map(|p| vec![p.to_string()]).unwrap_or_default()
             }
+            "shots" => {
+                let key = &i.id["shots:".len()..];
+                page_portal.get(key).map(|p| vec![p.to_string()]).unwrap_or_default()
+            }
             "shot" => {
                 let id = &i.id["shot:".len()..];
                 state
@@ -964,7 +1007,7 @@ pub fn item_portals(plan: &Plan, state: &State, cfg: &Config) -> BTreeMap<String
 /// Item kinds of a queue: `guides` (guides, translations, process guides, screenshots, system document) or `tests`.
 pub fn queue_kinds(queue: &str) -> Result<Vec<String>, String> {
     match queue {
-        "guides" | "guide" | "docs" => Ok(["guide", "translation", "process", "shot", "doc"]
+        "guides" | "guide" | "docs" => Ok(["guide", "translation", "process", "shots", "shot", "doc"]
             .map(String::from)
             .to_vec()),
         "tests" | "test" => Ok(vec!["tests".into()]),
@@ -985,7 +1028,12 @@ pub fn item_wanted(
     let portal_ok = portals.is_empty()
         || match item_portals.get(id) {
             Some(ps) => ps.iter().any(|p| portals.contains(p)),
-            None => !id.starts_with("guide:") && !id.starts_with("translation:") && !id.starts_with("shot:"),
+            None => {
+                !id.starts_with("guide:")
+                    && !id.starts_with("translation:")
+                    && !id.starts_with("shot:")
+                    && !id.starts_with("shots:")
+            }
         };
     kind_ok && portal_ok
 }
@@ -1228,6 +1276,46 @@ pub(crate) mod tests {
             .find(|i| i.id == "translation:id:shop.orders.create")
             .unwrap_or_else(|| panic!("{:?}", ids(&p)));
         assert!(t.reason.contains("en guide changed"), "{}", t.reason);
+    }
+
+    #[test]
+    fn written_guides_short_of_screenshots_get_a_shots_item() {
+        let (_d, mut cfg) = project();
+        cfg.guide.min_screenshots = None;
+        let mut st = State::default();
+        document(&cfg, &mut st);
+        let p = plan(&cfg, &mut api(), &mut st, &Scope::All).unwrap();
+        let item = p
+            .items
+            .iter()
+            .find(|i| i.id == "shots:shop.orders.create")
+            .unwrap_or_else(|| panic!("{:?}", ids(&p)));
+        assert_eq!(item.kind, ItemKind::Shots);
+        assert!(item.reason.contains("en 0/"), "{}", item.reason);
+        assert!(queue_kinds("guides").unwrap().contains(&"shots".to_string()));
+        // adding a screenshot to the guide does not make its translations stale
+        let h = crate::source::body_hash("Click **Save**.\n");
+        write_source(
+            &cfg,
+            "guide/id/orders/shop-orders-create.md",
+            &format!(
+                "---\ntitle: Pesanan Baru\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\ntranslated_from: {h}\n---\nKlik **Simpan**.\n"
+            ),
+        );
+        write_source(
+            &cfg,
+            "guide/en/orders/shop-orders-create.md",
+            &GUIDE.replace(
+                "Click **Save**.",
+                "Click **Save**.\n\n![Orders](guide/img/en/orders/shop-orders-create-1.webp)",
+            ),
+        );
+        let p = plan(&cfg, &mut api(), &mut st, &Scope::All).unwrap();
+        assert!(
+            !ids(&p).contains(&"translation:id:shop.orders.create".to_string()),
+            "{:?}",
+            ids(&p)
+        );
     }
 
     #[test]

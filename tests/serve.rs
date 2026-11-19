@@ -31,7 +31,7 @@ fn serve_answers_initialize_and_tools_list() {
     assert_eq!(a["id"], 1);
     assert_eq!(a["result"]["serverInfo"]["name"], "doctest");
     assert_eq!(b["id"], 2);
-    assert_eq!(b["result"]["tools"].as_array().unwrap().len(), 17);
+    assert_eq!(b["result"]["tools"].as_array().unwrap().len(), 18);
 }
 
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {

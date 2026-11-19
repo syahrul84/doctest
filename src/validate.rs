@@ -159,8 +159,11 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             .unwrap_or_else(|| crate::pages::screenshot_plan_for(&acts, no_data).len());
         let images = LINK.captures_iter(&text).filter(|c| &c[1] == "!").count();
         if images < min {
-            out.push(Problem::error(format!(
-                "this page guide needs at least {min} screenshots (the page, one form shot for Add and Edit, one per other action: facts.screenshot_plan); it has {images}{}",
+            // text first: screenshots come after (shoot_pages takes the page shot, a shots:<page> item the rest)
+            out.push(Problem::warning(format!(
+                "{images} of {min} screenshots so far (the page, one form shot for Add and Edit, one per other action) — \
+                 fine while writing: shoot_pages adds the page shot and a shots:{} item asks for the rest{}",
+                src.fm.routes.first().map(String::as_str).unwrap_or("<page>"),
                 if no_data { "" } else { ". If the page has no records to show, put <!-- no-data: why --> in the guide and fewer are needed" }
             )));
         }
@@ -440,8 +443,9 @@ mod tests {
             "{msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| m.contains("3 screenshots") && m.contains("has 0")),
-            "{msgs:?}"
+            p.iter()
+                .any(|x| x.level == Level::Warning && x.message.contains("0 of 3 screenshots")),
+            "{p:?}"
         );
         assert!(
             p.iter()

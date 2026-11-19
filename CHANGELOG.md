@@ -6,6 +6,14 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- Text first, screenshots after: guides are written without screenshots (a `<!-- shot -->` line marks each place);
+  `shoot_pages` takes every page's opening screenshot in parallel without the AI and puts it in every language's
+  guide; `shots:<page>` items ask for the action screenshots once the writing is done. A guide short of
+  screenshots is a warning, not a refusal, and screenshots do not make translations stale.
+- Screenshots no longer hang for 15 minutes: Chrome calls time out after 60 s, a shot after 90 s, page dialogs are
+  answered, and route containers (`<router-view/>` only) are not pages. `shoot` returns the image only with
+  `show: true`; crops below the fold of a layout's scroll box work, and a blank image is refused.
+
 - A shot that lands on the sign-in page no longer says "session expired" when it is not: it names the request the
   server refused (401/419) or safe mode refused, and the worker's browser starts again from the saved session, so
   later shots keep working (before, every later shot of that worker failed).

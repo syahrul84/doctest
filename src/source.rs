@@ -251,7 +251,29 @@ pub fn guide_path(lang: &str, portal: &str, module: &str, page_key: &str) -> Pat
 
 /// Hash of a body, ignoring trailing whitespace.
 pub fn body_hash(body: &str) -> String {
+    crate::hash::sha256(&without_images(body))
+}
+
+/// The hash translations stored before screenshots were left out of it; still accepted so they stay current.
+pub fn body_hash_v1(body: &str) -> String {
     crate::hash::sha256(body.trim_end())
+}
+
+/// A guide's text without its images and screenshot markers: adding a screenshot to a guide does not make its
+/// translations stale.
+fn without_images(body: &str) -> String {
+    static IMG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*(!\[[^\]]*\]\([^)]*\)|<!--\s*shot:[^>]*-->)[ \t]*\n?").unwrap()
+    });
+    let text = IMG.replace_all(body, "");
+    static BLANKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+    BLANKS.replace_all(&text, "\n\n").trim_end().to_string()
+}
+
+/// Is a translation's `translated_from` the current text of its primary guide?
+pub fn translated_from_current(stored: Option<&str>, primary_body: &str) -> bool {
+    stored.is_some_and(|h| h == body_hash(primary_body) || h == body_hash_v1(primary_body))
 }
 
 #[cfg(test)]
@@ -319,6 +341,19 @@ mod tests {
         );
         assert_eq!(slug("anpManagement"), "anp-management");
         assert_eq!(slug("financialGL"), "financial-gl");
+    }
+
+    #[test]
+    fn body_hash_ignores_screenshots() {
+        let text = "Open it.\n\n![page](guide/img/en/m/p-1.webp)\n\n## Add\n1. Click.\n";
+        let bare = "Open it.\n\n<!-- shot: the page as it opens -->\n\n## Add\n1. Click.\n";
+        assert_eq!(body_hash(text), body_hash(bare));
+        assert_eq!(body_hash(text), body_hash("Open it.\n\n## Add\n1. Click.\n"));
+        assert!(
+            translated_from_current(Some(&body_hash_v1(text)), text),
+            "old hashes stay current"
+        );
+        assert!(!translated_from_current(Some(&body_hash("other")), text));
     }
 
     #[test]

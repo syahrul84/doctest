@@ -19,9 +19,9 @@ use crate::state::{CoverSource, RunRecord, State};
 use crate::testwrite::{self, NewTests};
 use crate::work::{self, Scope};
 
-const SHOOT_HELP: &str = "Take (or retake) a screenshot. Send a spec {id, page, path, params, user, lang, steps, crop, mask, allow_saves}, or an id alone to retake its stored spec. Returns the image and the path to reference.\nsteps (in order): {\"fill\": \"css\", \"value\": \"text\"} clears the field then types; {\"select\": \"css\", \"value\": \"v\"}; {\"click\": \"css\"}; {\"wait\": \"css\"} waits for an element; {\"wait_text\": \"Saved\"} waits for text; {\"scroll\": \"css\" | \"top\" | \"bottom\"}; {\"goto\": \"/path\"}.\nmask (on top of [screenshots] mask; inside shadow roots too, re-applied when the page re-renders): {\"selector\": \"css\", \"text\": \"Demo\"} replaces text or input values; {\"regex\": \"[A-Z]{2}-\\\\d+\", \"text\": \"AB-1\"} a JavaScript regex ((?i) at the start ignores case); {\"hide\": \"css\"} hides elements. The reply names masks that matched nothing.\ncrop: a CSS selector to capture just that element (scrolled into view first).\nSafe mode (on unless [screenshots] safe = false): the browser refuses POST/PUT/PATCH/DELETE while shooting, so steps cannot save or delete; the reply lists what it blocked. Set allow_saves only to show a real save result, on test data; retaking that spec saves again.";
+const SHOOT_HELP: &str = "Take (or retake) a screenshot. Send a spec {id, page, path, params, user, lang, steps, crop, mask, allow_saves}, or an id alone to retake its stored spec. Returns the path to reference (and the image itself only with show: true). A shot stops after 90 s, a blank image is refused, and alert, confirm and leave-page dialogs are answered (confirm with Cancel).\nsteps (in order): {\"fill\": \"css\", \"value\": \"text\"} clears the field then types; {\"select\": \"css\", \"value\": \"v\"}; {\"click\": \"css\"}; {\"wait\": \"css\"} waits for an element; {\"wait_text\": \"Saved\"} waits for text; {\"scroll\": \"css\" | \"top\" | \"bottom\"}; {\"goto\": \"/path\"}.\nmask (on top of [screenshots] mask; inside shadow roots too, re-applied when the page re-renders): {\"selector\": \"css\", \"text\": \"Demo\"} replaces text or input values; {\"regex\": \"[A-Z]{2}-\\\\d+\", \"text\": \"AB-1\"} a JavaScript regex ((?i) at the start ignores case); {\"hide\": \"css\"} hides elements. The reply names masks that matched nothing.\ncrop: a CSS selector to capture just that element (scrolled into view first).\nSafe mode (on unless [screenshots] safe = false): the browser refuses POST/PUT/PATCH/DELETE while shooting, so steps cannot save or delete; the reply lists what it blocked. Set allow_saves only to show a real save result, on test data; retaking that spec saves again.";
 
-pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides; take every screenshot in facts.screenshot_plan: the page, one form shot for Add and Edit, one per other action), then translations (translation items; same structure, labels in that language; they reuse the primary guide's screenshots unless facts says otherwise). Screenshots: shoot a spec (path, params for :id, steps, crop, user, lang), then reference the returned image path in the guide with ![alt](guide/img/<lang>/<id>.webp). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
+pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shots:<page>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides, text first: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides) WITHOUT screenshots: put a line <!-- shot: what it shows --> where each screenshot of facts.screenshot_plan belongs, and do not call shoot for guide items. Then translations (translation items; same structure, labels in that language, the same <!-- shot --> lines). When the guides are written, call shoot_pages once: doctest takes every page's opening screenshot itself, in parallel, and puts it in each language's guide. Last come shots:<page> items, for the action screenshots only: shoot a spec (path, params for :id, steps, crop, user, lang) and replace the matching <!-- shot --> line with ![alt](guide/img/<lang>/<id>.webp) in the primary guide and in every translation (translations reuse the primary language's images unless facts says otherwise). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. Failing rows are removed and reported; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer.\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
 pub type Factory = std::sync::Arc<dyn Fn(&Config, usize) -> Box<dyn CodemapApi + Send> + Send + Sync>;
@@ -108,9 +108,15 @@ pub fn tools() -> Value {
             &["item", "markdown"]
         ),
         tool(
+            "shoot_pages",
+            "Text first, then this: takes every written page guide's opening screenshot (the page as it opens, no steps) itself, several browsers at once, and puts it in the primary guide and every translation, at the <!-- shot: the page as it opens --> line or after the first paragraph. Pages whose path needs an :id, and pages that already show a screenshot, are left for their shots:<page> item. Long: reports progress.",
+            json!({"portals": {"type": "array", "items": {"type": "string"}, "description": "only these portals' pages"}, "limit": {"type": "integer", "description": "at most this many pages (to try it on a few first)"}, "retake": {"type": "boolean", "description": "shoot again even where the image file exists"}}),
+            &[]
+        ),
+        tool(
             "shoot",
             SHOOT_HELP,
-            json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}, "retake_page": {"type": "string", "description": "with lang: retake every stored screenshot of this page in that language ([screenshots] per_language)"}, "lang": {"type": "string"}}),
+            json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}, "retake_page": {"type": "string", "description": "with lang: retake every stored screenshot of this page in that language ([screenshots] per_language)"}, "lang": {"type": "string"}, "show": {"type": "boolean", "description": "send the image back to look at it (off by default: the reply already says when a shot is blank, on the sign-in page, blocked a save or masked nothing)"}}),
             &[]
         ),
         tool(
@@ -425,7 +431,14 @@ impl Server {
                 }
                 let (got, left) = State::update(&p.cfg, |s| {
                     let ip = s.item_portals.clone();
-                    let wanted = |id: &str| work::item_wanted(id, &kinds, &portals, &ip);
+                    // text first: screenshot items wait until every guide and translation is written
+                    let writing = s
+                        .queue
+                        .iter()
+                        .any(|id| id.starts_with("guide:") || id.starts_with("translation:"));
+                    let wanted = |id: &str| {
+                        work::item_wanted(id, &kinds, &portals, &ip) && !(writing && id.starts_with("shots:"))
+                    };
                     let got: Vec<(String, String)> = s
                         .claim_where(&worker, count, crate::state::now(), &wanted)
                         .into_iter()
@@ -437,8 +450,13 @@ impl Server {
                     let left = s.queue.iter().filter(|id| wanted(id)).count();
                     (got, left)
                 })?;
+                let note = if got.iter().any(|(id, _)| id.starts_with("shots:")) {
+                    "screenshot items: if shoot_pages has not run since the guides were written, call it once first (it takes every page's opening shot); then per item take only the shots still missing (facts → shoot → write_doc for each language); claims expire after 30 minutes"
+                } else {
+                    "work these items (facts → write_doc / write_test; guides are written without screenshots); a written item leaves the queue; screenshot items come when every guide and translation is written; claims expire after 30 minutes"
+                };
                 text(pretty(
-                    &json!({"worker": worker, "items": got.iter().map(|(id, r)| json!({"id": id, "reason": r})).collect::<Vec<_>>(), "queued": left, "note": "work these items (facts → write_doc / shoot / write_test); a written item leaves the queue; claims expire after 30 minutes"}),
+                    &json!({"worker": worker, "items": got.iter().map(|(id, r)| json!({"id": id, "reason": r})).collect::<Vec<_>>(), "queued": left, "note": note}),
                 ))
             }
             "facts" => text(facts(p, s(args, "item").ok_or("item is required")?)?),
@@ -448,6 +466,7 @@ impl Server {
                 s(args, "markdown").ok_or("markdown is required")?,
             )?),
             "shoot" => shoot(p, args),
+            "shoot_pages" => text(shoot_pages(p, args, progress)?),
             "cases" => text(cases_text(p, s(args, "target").ok_or("target is required")?)?),
             "write_test" => text(write_test(p, args)?),
             "run_tests" => text(run_tests(p, s(args, "filter"))?),
@@ -1195,7 +1214,7 @@ fn split_item(item: &str) -> Result<(&str, &str, &str), String> {
             }
             Ok((kind, "", rest))
         }
-        "shot" | "tests" => Ok((kind, "", rest)),
+        "shot" | "tests" | "shots" => Ok((kind, "", rest)),
         _ => Err(format!("unknown item kind {kind}")),
     }
 }
@@ -1211,10 +1230,10 @@ fn check_lang(cfg: &Config, lang: &str) -> Result<(), String> {
     }
 }
 
-fn skeleton(f: &crate::pages::PageFacts, lang: &str) -> String {
+fn skeleton(f: &crate::pages::PageFacts) -> String {
     let title = f.menu_titles.last().cloned().unwrap_or_else(|| f.page.key.clone());
     let mut md = format!(
-        "---\ntitle: {title}\nkind: page\nmodule: {}\nroutes: [{}]\norder: 10\nsummary: TODO one line\n---\n# {title}\n\nTODO what this page is for.\n\n## Before you start\n\n## Step by step\n1. Open {}.\n\n## Fields\n\n| Field | What to enter | Required |\n| --- | --- | --- |\n",
+        "---\ntitle: {title}\nkind: page\nmodule: {}\nroutes: [{}]\norder: 10\nsummary: TODO one line\n---\n# {title}\n\nTODO what this page is for.\n\n<!-- shot: the page as it opens -->\n\n## Before you start\n\n## Step by step\n1. Open {}.\n\n## Fields\n\n| Field | What to enter | Required |\n| --- | --- | --- |\n",
         f.page.module,
         f.page.key,
         f.menu_titles
@@ -1235,7 +1254,7 @@ fn skeleton(f: &crate::pages::PageFacts, lang: &str) -> String {
     }
     for a in crate::pages::actions(f) {
         md += &format!(
-            "\n## {} …\n\n1. TODO steps (bold only on-screen names).\n\n**What you should see:** {}\n\n![{} result](guide/img/{lang}/{}/{}-N.webp)\n",
+            "\n## {} …\n\n1. TODO steps (bold only on-screen names).\n\n**What you should see:** {}\n\n<!-- shot: {}: the form or dialog -->\n",
             a.name,
             if a.success.is_empty() {
                 "TODO the result on screen".to_string()
@@ -1243,8 +1262,6 @@ fn skeleton(f: &crate::pages::PageFacts, lang: &str) -> String {
                 a.success.iter().map(|m| format!("*{m}*")).collect::<Vec<_>>().join(" ")
             },
             a.name,
-            source::slug(&f.page.module),
-            source::slug(&f.page.key)
         );
         if !a.required.is_empty() {
             md += &format!(
@@ -1326,7 +1343,7 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 "components": f.components,
                 "current_text": current,
                 "primary_text": primary_text,
-                "skeleton": if kind == "guide" && current.is_none() { Some(skeleton(&f, lang)) } else { None },
+                "skeleton": if kind == "guide" && current.is_none() { Some(skeleton(&f)) } else { None },
                 "actions": crate::pages::actions(&f),
                 "possible_actions": crate::pages::possible_actions(&f),
                 "possible_actions_note": "reached only through shared code (a shared screen, a layout or an API module) and no matching button was found on the page: document one only if you see it on the screen; they are not required",
@@ -1334,10 +1351,10 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 "optional_screenshots": crate::pages::optional_shots(&crate::pages::actions(&f)),
                 "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&crate::pages::actions(&f), true),
                 "min_screenshots": cfg.guide.min_screenshots.unwrap_or(crate::pages::screenshot_plan(&crate::pages::actions(&f)).len()),
-                "screenshots_note": "screenshot_plan is required (one form shot covers Add and Edit); optional_screenshots only where they make a step clearer. If the page has no records to show (and you cannot add demo data safely), put <!-- no-data: why --> in the guide: then only screenshot_plan_without_data is required.",
+                "screenshots_note": "Text first: write the guide now WITHOUT screenshots, leaving a line <!-- shot: what it shows --> where each screenshot in screenshot_plan belongs (the skeleton has them). Do not call shoot for this item. Later shoot_pages takes every page's opening shot itself and puts it at <!-- shot: the page as it opens -->, and a shots:<page> item asks for the action shots. If the page has no records to show, put <!-- no-data: why --> in the guide: then only screenshot_plan_without_data is needed.",
                 "screenshots": shots,
                 "image_ref_format": format!("guide/img/{lang}/{}/{}-<n>.webp", source::slug(&page.module), source::slug(&page.key)),
-                "rules": "Bold (**...**) only on-screen names from labels, literal_texts or menu_path. Exact on-screen message texts in italics. One section per action (heading naming it) with numbered steps and 'What you should see' after Add, Edit, Delete and every other action, including the validation errors for required fields. Take the screenshots in screenshot_plan (at least min_screenshots); optional_screenshots only where they help.",
+                "rules": "Bold (**...**) only on-screen names from labels, literal_texts or menu_path. Exact on-screen message texts in italics. One section per action (heading naming it) with numbered steps and 'What you should see' after Add, Edit, Delete and every other action, including the validation errors for required fields. No screenshots yet: a <!-- shot: … --> line where each one goes.",
             })))
         }
         "process" => {
@@ -1408,6 +1425,50 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 "server": server,
                 "details": extra,
                 "rules": "Write for a real server, not localhost. Every step must come from these facts; put <!-- unverified --> on its own line before any step the repo does not back. Mention every env key by name in index or system/configuration.",
+            })))
+        }
+        "shots" => {
+            let pages = fb.pages()?;
+            let page = pages
+                .iter()
+                .find(|x| x.key == key)
+                .ok_or_else(|| format!("no page {key}"))?;
+            let f = fb.facts(page)?;
+            let acts = crate::pages::actions(&f);
+            let st = State::load(&cfg);
+            let shots: Vec<&ShotSpec> = st.shots.values().filter(|s| s.page == key).collect();
+            let marker = regex::Regex::new(r"<!--\s*shot:\s*([^>]*?)\s*-->").expect("regex");
+            let guides: Vec<Value> = cfg
+                .languages
+                .iter()
+                .filter_map(|lang| {
+                    let g = work::page_guide(&sources, key, lang)?;
+                    let item = if *lang == primary {
+                        format!("guide:{lang}:{key}")
+                    } else {
+                        format!("translation:{lang}:{key}")
+                    };
+                    Some(json!({
+                        "lang": lang,
+                        "write_doc_item": item,
+                        "images": work::guide_images(&g.body),
+                        "places_left": marker.captures_iter(&g.body).map(|c| c[1].to_string()).collect::<Vec<_>>(),
+                        "text": g.render_text(),
+                    }))
+                })
+                .collect();
+            Ok(pretty(&json!({
+                "item": item,
+                "page": {"key": f.page.key, "path": f.page.path, "portal": f.page.portal, "module": f.page.module},
+                "missing": work::shots_short(&cfg, &sources, key, &f),
+                "screenshot_plan": crate::pages::screenshot_plan(&acts),
+                "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&acts, true),
+                "actions": acts,
+                "labels": f.labels.get(&primary),
+                "screenshots_taken": shots,
+                "guides": guides,
+                "image_ref_format": format!("guide/img/{primary}/{}/{}-<n>.webp", source::slug(&f.page.module), source::slug(&f.page.key)),
+                "how": format!("Take only the screenshots still missing (the page's opening shot is shoot_pages' job; if it is missing because the path needs an :id, shoot it with params). For each: shoot a spec with the steps that open the form or dialog, then in EVERY guide listed replace the matching <!-- shot: … --> line (places_left) with ![alt](the returned image path) — the {primary} image in every language unless the project shoots per language — and send each guide back with write_doc using its write_doc_item. Change nothing else in the text. The item is done when every language has its screenshots."),
             })))
         }
         "shot" => {
@@ -1560,6 +1621,13 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
         }
         _ => None,
     };
+    // the page's screenshots are complete in every language: its shots item is done too
+    let shots_done = match (&facts, &page) {
+        (Some(f), Some(pg)) => work::shots_short(&cfg, &sources, &pg.key, f)
+            .is_empty()
+            .then(|| format!("shots:{}", pg.key)),
+        _ => None,
+    };
     let st = State::update(&cfg, |st| {
         if let Some((key, fp)) = &fp {
             let e = st.pages.entry(key.clone()).or_default();
@@ -1567,6 +1635,9 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
             e.documented_fingerprint = Some(fp.clone());
         }
         st.done(item);
+        if let Some(s) = &shots_done {
+            st.done(s);
+        }
         st.clone()
     })?;
     let r = crate::html::build(&cfg, &source::sources(&cfg)?, &st)?;
@@ -1590,6 +1661,228 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
             format!("\nwarnings:\n- {}", warnings.join("\n- "))
         }
     ))
+}
+
+/// The marker the guide skeleton leaves where the page's opening screenshot goes.
+const PAGE_SHOT_MARKER: &str = "<!-- shot: the page as it opens -->";
+
+/// Puts an image line in a guide's text: in place of the page-shot marker, else after the first paragraph of the
+/// body (below the title). Returns None when the text already shows that image.
+pub fn insert_page_shot(text: &str, image_line: &str, image_ref: &str) -> Option<String> {
+    if text.contains(image_ref) {
+        return None;
+    }
+    if let Some(i) = text.find(PAGE_SHOT_MARKER) {
+        return Some(format!(
+            "{}{image_line}{}",
+            &text[..i],
+            &text[i + PAGE_SHOT_MARKER.len()..]
+        ));
+    }
+    // after the front matter
+    let body_start = text
+        .strip_prefix("---")
+        .and_then(|rest| rest.find("\n---").map(|e| 3 + e + 4))
+        .unwrap_or(0);
+    let lines: Vec<&str> = text[body_start..].split_inclusive('\n').collect();
+    let mut pos = body_start;
+    let mut seen_text = false;
+    for l in &lines {
+        let t = l.trim();
+        let heading = t.starts_with('#');
+        if seen_text && (t.is_empty() || heading) {
+            break;
+        }
+        if !t.is_empty() && !heading {
+            seen_text = true;
+        }
+        pos += l.len();
+    }
+    let (head, tail) = text.split_at(pos);
+    let head = if head.ends_with('\n') {
+        head.to_string()
+    } else {
+        format!("{head}\n")
+    };
+    Some(format!(
+        "{head}\n{image_line}\n{}",
+        if tail.starts_with('\n') {
+            tail.to_string()
+        } else {
+            format!("\n{tail}")
+        }
+    ))
+}
+
+/// `shoot_pages`: the opening screenshot of every written page guide, taken by doctest in parallel and put in each
+/// language's guide.
+fn shoot_pages(p: &mut Project, args: &Value, progress: &dyn crate::progress::Progress) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let eff = effective_cfg(p)?;
+    let cfg = p.cfg.clone();
+    let sources = source::sources(&cfg)?;
+    let labels = Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+    let mut fb = FactBuilder::new(&mut *p.api, &cfg, &labels);
+    let pages = fb.pages()?;
+    drop(fb);
+    let primary = cfg.primary_language().to_string();
+    let portals: Vec<String> = args
+        .get("portals")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(usize::MAX);
+    let retake = args.get("retake").and_then(Value::as_bool).unwrap_or(false);
+    let mut todo: Vec<(crate::pages::Page, ShotSpec, bool)> = Vec::new();
+    let mut need_params = Vec::new();
+    for page in &pages {
+        if !portals.is_empty() && !portals.contains(&page.portal) {
+            continue;
+        }
+        let Some(g) = work::page_guide(&sources, &page.key, &primary) else {
+            continue;
+        };
+        let text = g.render_text();
+        if !text.contains(PAGE_SHOT_MARKER) && work::guide_images(&g.body) > 0 {
+            continue;
+        }
+        if page.path.contains(':') || page.path.contains('{') {
+            need_params.push(page.key.clone());
+            continue;
+        }
+        if todo.len() >= limit {
+            break;
+        }
+        let mut spec = ShotSpec {
+            id: format!("{}/{}-1", source::slug(&page.module), source::slug(&page.key)),
+            page: page.key.clone(),
+            path: page.path.clone(),
+            lang: primary.clone(),
+            ..ShotSpec::default()
+        };
+        spec.user = shot_user(&eff, &spec);
+        let have = crate::shots::image_path(&cfg, &spec).is_file() && !retake;
+        todo.push((page.clone(), spec, have));
+    }
+    let total = todo.len();
+    let to_shoot: Vec<(String, ShotSpec)> = todo
+        .iter()
+        .filter(|(_, _, have)| !have)
+        .map(|(pg, s, _)| (pg.key.clone(), s.clone()))
+        .collect();
+    let queue = std::sync::Mutex::new(to_shoot);
+    let results: std::sync::Mutex<Vec<(String, Result<crate::shots::Shot, String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let done = std::sync::atomic::AtomicUsize::new(total - queue.lock().expect("queue").len());
+    let workers = cfg.workers.clamp(1, 8);
+    std::thread::scope(|sc| {
+        for _ in 0..workers {
+            sc.spawn(|| {
+                let mut shooter = match Shooter::start(&eff) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut q = queue.lock().expect("queue");
+                        let mut r = results.lock().expect("results");
+                        for (key, _) in q.drain(..) {
+                            r.push((key, Err(e.clone())));
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    let Some((key, spec)) = queue.lock().expect("queue").pop() else {
+                        break;
+                    };
+                    let r = shooter.capture(&spec);
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    progress.step(
+                        n,
+                        total,
+                        &format!("{} ({})", key, if r.is_ok() { "ok" } else { "failed" }),
+                    );
+                    results.lock().expect("results").push((key, r));
+                }
+            });
+        }
+    });
+    let results = results.into_inner().expect("results");
+    let failed: BTreeMap<String, String> = results
+        .iter()
+        .filter_map(|(k, r)| r.as_ref().err().map(|e| (k.clone(), e.clone())))
+        .collect();
+    // put each image in every language's guide
+    let root = source::source_root(&cfg);
+    let mut placed = 0;
+    let mut guides = 0;
+    let mut taken: Vec<ShotSpec> = Vec::new();
+    for (page, spec, _) in &todo {
+        if failed.contains_key(&page.key) {
+            continue;
+        }
+        taken.push(spec.clone());
+        let image_ref = crate::shots::image_ref(spec);
+        let mut any = false;
+        for lang in &cfg.languages {
+            let Some(g) = work::page_guide(&sources, &page.key, lang) else {
+                continue;
+            };
+            let file = root.join(&g.path);
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let line = format!("![{}]({image_ref})", g.fm.title.replace(['[', ']'], ""));
+            if let Some(new) = insert_page_shot(&text, &line, &image_ref) {
+                std::fs::write(&file, new).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+                guides += 1;
+                any = true;
+            }
+        }
+        if any {
+            placed += 1;
+        }
+    }
+    let sources = source::sources(&cfg)?;
+    let st = State::update(&cfg, |st| {
+        for spec in &taken {
+            st.shots.insert(spec.id.clone(), spec.clone());
+            let e = st.pages.entry(spec.page.clone()).or_default();
+            if !e.shots.contains(&spec.id) {
+                e.shots.push(spec.id.clone());
+            }
+            st.done(&format!("shot:{}", spec.id));
+        }
+        st.clone()
+    })?;
+    let built = crate::html::build(&cfg, &sources, &st)?;
+    let shot_now = results.len() - failed.len();
+    let mut out = format!(
+        "{} page(s): {shot_now} screenshot(s) taken with {workers} browser(s), {} already there; put in {guides} guide(s) of {placed} page(s); built {} files in {}",
+        total,
+        total - results.len(),
+        built.written.len(),
+        took(started.elapsed())
+    );
+    if !failed.is_empty() {
+        out += &format!("\nfailed ({}):", failed.len());
+        for (k, e) in failed.iter().take(40) {
+            out += &format!("\n- {k}: {e}");
+        }
+        if failed.len() > 40 {
+            out += &format!("\n- … and {} more", failed.len() - 40);
+        }
+    }
+    if !need_params.is_empty() {
+        out += &format!(
+            "\nneed an :id, left for their shots:<page> item ({}): {}",
+            need_params.len(),
+            need_params.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(out)
 }
 
 /// `shoot {retake_page, lang}`: every stored screenshot of a page, retaken in another language.
@@ -1701,19 +1994,39 @@ fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
             shot.unmatched_masks.join(", ")
         ));
     }
+    if !shot.dialogs.is_empty() {
+        notes.push(format!(
+            "the page opened {} and doctest answered: {} — if one is an error, the screenshot may show the wrong state",
+            if shot.dialogs.len() == 1 {
+                "a dialog".to_string()
+            } else {
+                format!("{} dialogs", shot.dialogs.len())
+            },
+            shot.dialogs.join("; ")
+        ));
+    }
     let bytes = std::fs::read(&shot.path).map_err(|e| e.to_string())?;
+    let (w, h) = image::image_dimensions(&shot.path).unwrap_or((0, 0));
+    let show = args.get("show").and_then(Value::as_bool).unwrap_or(false);
     let mut text = format!(
-        "saved {}; reference it as ![…]({})",
+        "saved {} ({w}x{h}, {} KB); reference it as ![…]({}){}",
         shot.path.display(),
-        crate::shots::image_ref(&spec)
+        bytes.len() / 1024,
+        crate::shots::image_ref(&spec),
+        if show {
+            ""
+        } else {
+            " — the image is not sent back (send show: true to see it)"
+        }
     );
     for n in &notes {
         text += &format!("\n- {n}");
     }
-    Ok(vec![
-        json!({"type": "text", "text": text}),
-        json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": "image/webp"}),
-    ])
+    let mut out = vec![json!({"type": "text", "text": text})];
+    if show {
+        out.push(json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": "image/webp"}));
+    }
+    Ok(out)
 }
 
 /// The endpoint or method behind a target, its action (for the test file) and its expected cases.
@@ -2053,6 +2366,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs Chrome"]
+    fn shoot_pages_takes_each_written_page_and_puts_it_in_every_language() {
+        let port = crate::shots::tests::serve();
+        let (_d, cfg) = project();
+        let toml = std::fs::read_to_string(cfg.root.join(".doctest.toml")).unwrap()
+            + &format!("[app]\nbase_url=\"http://127.0.0.1:{port}\"\n");
+        std::fs::write(cfg.root.join(".doctest.toml"), toml).unwrap();
+        let cfg = Config::find(&cfg.root).unwrap();
+        let src = cfg.out.join("_source/guide");
+        for (lang, title, body) in [
+            ("en", "New Order", "Create an order."),
+            ("id", "Pesanan Baru", "Buat pesanan."),
+        ] {
+            std::fs::create_dir_all(src.join(lang).join("orders")).unwrap();
+            std::fs::write(
+                src.join(lang).join("orders/shop-orders-create.md"),
+                format!("---\ntitle: {title}\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\n---\n# {title}\n\n{body}\n\n<!-- shot: the page as it opens -->\n\n## Add\n1. Click **Save**.\n"),
+            )
+            .unwrap();
+        }
+        let mut s = server();
+        let (text, err) = call(&mut s, "shoot_pages", json!({"project": cfg.root}));
+        assert!(
+            !err && text.contains("1 screenshot(s) taken") && text.contains("put in 2 guide(s)"),
+            "{text}"
+        );
+        let image = "guide/img/en/orders/shop-orders-create-1.webp";
+        assert!(cfg.out.join(image).is_file());
+        let en = std::fs::read_to_string(src.join("en/orders/shop-orders-create.md")).unwrap();
+        let id = std::fs::read_to_string(src.join("id/orders/shop-orders-create.md")).unwrap();
+        assert!(
+            en.contains(&format!("![New Order]({image})")) && !en.contains("<!-- shot: the page"),
+            "{en}"
+        );
+        assert!(id.contains(&format!("![Pesanan Baru]({image})")), "{id}");
+        // a second run finds nothing left to take
+        let (text, _) = call(&mut s, "shoot_pages", json!({"project": cfg.root}));
+        assert!(text.starts_with("0 page(s)"), "{text}");
+    }
+
+    #[test]
+    fn page_shot_goes_at_its_marker_or_after_the_first_paragraph() {
+        let img = "![Orders](guide/img/en/o/p-1.webp)";
+        let r = "guide/img/en/o/p-1.webp";
+        let marked =
+            "---\ntitle: Orders\n---\n# Orders\n\nLists orders.\n\n<!-- shot: the page as it opens -->\n\n## Add\n";
+        assert_eq!(
+            insert_page_shot(marked, img, r).unwrap(),
+            "---\ntitle: Orders\n---\n# Orders\n\nLists orders.\n\n![Orders](guide/img/en/o/p-1.webp)\n\n## Add\n"
+        );
+        let plain = "---\ntitle: Orders\n---\n# Orders\n\nLists orders\nof the shop.\n\n## Add\n1. Click.\n";
+        assert_eq!(
+            insert_page_shot(plain, img, r).unwrap(),
+            "---\ntitle: Orders\n---\n# Orders\n\nLists orders\nof the shop.\n\n![Orders](guide/img/en/o/p-1.webp)\n\n## Add\n1. Click.\n"
+        );
+        let done = insert_page_shot(plain, img, r).unwrap();
+        assert!(insert_page_shot(&done, img, r).is_none(), "already there");
+    }
+
+    #[test]
     fn initialize_and_list_tools() {
         let mut s = server();
         let init = s.handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})).unwrap();
@@ -2075,6 +2448,7 @@ mod tests {
                 "claim",
                 "facts",
                 "write_doc",
+                "shoot_pages",
                 "shoot",
                 "cases",
                 "write_test",

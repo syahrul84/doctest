@@ -135,6 +135,17 @@ A guide needs the page, one form shot for Add and Edit, and one shot per other a
 If a page has no records to show, put `<!-- no-data: why -->` in the guide and only what works without records is
 required.
 
+Text first, screenshots after. Guides and translations are written without screenshots, with a
+`<!-- shot: what it shows -->` line where each one goes. Then `shoot_pages` takes every page's opening screenshot
+itself, several browsers at once and with no AI involved, and puts it in each language's guide. Last, a
+`shots:<page>` item per page asks the AI for the action screenshots only (the Add form, a dialog); those items are
+handed out once every guide and translation is written. Adding a screenshot to a guide does not make its
+translations stale. `shoot` sends the image back only with `show: true`, and refuses a blank image.
+
+A shot cannot hang: each Chrome call gives up after 60 seconds and a shot after 90, alert, confirm and leave-page
+dialogs are answered (confirm with Cancel) and listed in the reply, and parent routes whose page only holds child
+pages (`<router-view/>`) are not listed as pages.
+
 ## Portals and signing in
 
 doctest reads every screen of the app, whatever it is built with: Vue 2 / Vue 3 / Nuxt pages (a separate repo or
