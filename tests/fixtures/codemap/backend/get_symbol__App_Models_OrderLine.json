@@ -1,0 +1,1 @@
+{"data":{"found":true,"fqn":"App\\Models\\OrderLine","kind":"class","file":"app/Models/OrderLine.php","line":7,"model":{"table":"order_lines","relations":[]}},"meta":{}}

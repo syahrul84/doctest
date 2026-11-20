@@ -1,0 +1,1 @@
+{"data":{"found":true,"name":"ShopOrderForm","file":"src/pages/ShopOrderForm.vue","kind":"page","renders":["<OrderCustomer> :4 → src/components/OrderCustomer.vue","<v-btn> :6 → external: vuetify"],"composables":["useOrderForm :12 → src/api/orders.ts:2"],"i18n":{"keys":["message.newOrder"]}},"meta":{"project":"web"}}

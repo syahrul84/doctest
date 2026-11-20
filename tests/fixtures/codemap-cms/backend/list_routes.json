@@ -1,0 +1,6 @@
+{"data":{"found":true,"routes":[
+ {"methods":"GET|HEAD","uri":"portal/login","name":"portal.login","action":"App\\Http\\Controllers\\Portal\\Auth\\LoginController@show","middleware":["web"],"returns":"unknown (returns `view('portal.auth.login', ['kind' => $kind])`, which is not a Resource or literal array)"},
+ {"methods":"GET|HEAD","uri":"portal/dashboard","name":"portal.dashboard","action":"App\\Http\\Controllers\\Portal\\DashboardController@show","middleware":["web","auth:member"],"returns":"unknown (returns `view('portal.dashboard')`, which is not a Resource or literal array)"},
+ {"methods":"POST","uri":"portal/profile","name":"portal.profile.update","action":"App\\Http\\Controllers\\Portal\\ProfileController@update","middleware":["web","auth:member"]},
+ {"methods":"GET|HEAD","uri":"api/shops","name":"api.shops.index","action":"App\\Http\\Controllers\\Api\\ShopController@index","middleware":["api"],"returns":"json → data"}
+]},"meta":{}}

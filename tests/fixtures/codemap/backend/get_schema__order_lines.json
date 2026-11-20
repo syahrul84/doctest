@@ -1,0 +1,1 @@
+{"data":{"found":true,"table":"order_lines","columns":[{"name":"id","type":"bigint","keys":["primary"]},{"name":"order_id","type":"bigint","keys":["index"]}],"created_in":"database/migrations/2026_01_01_000001_create_order_lines_table.php:10"},"meta":{}}

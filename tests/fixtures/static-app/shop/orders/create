@@ -1,0 +1,1 @@
+<!doctype html><html><body><div class="admin-layout"><h1>New Order</h1><label>Customer <input name="customer"></label><button>Save</button></div></body></html>

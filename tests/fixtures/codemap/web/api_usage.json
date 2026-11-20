@@ -1,0 +1,1 @@
+{"data": {"calls": [{"at": "src/api/orders.ts:2", "call": "POST /orders/{}", "via": "api.post", "status": "matched", "route": "POST api/orders/{order}"}, {"at": "src/api/orders.ts:4", "call": "DELETE /everything", "via": "api.delete", "status": "matched", "route": "DELETE api/everything"}]}, "meta": {"project": "web"}}
