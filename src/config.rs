@@ -33,6 +33,9 @@ pub struct AppConfig {
     pub users: Vec<(String, UserCreds)>,
     pub login_steps: Vec<Step>,
     pub locale_steps: Vec<Step>,
+    /// Read the page list from the running app's router too (default on): it finds routes that helper functions
+    /// build, which reading the route files cannot.
+    pub live_routes: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -192,6 +195,7 @@ struct RawApp {
     login_steps: Vec<Step>,
     #[serde(default)]
     locale_steps: Vec<Step>,
+    live_routes: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -317,6 +321,7 @@ impl Config {
                 users,
                 login_steps: raw.app.login_steps,
                 locale_steps: raw.app.locale_steps,
+                live_routes: raw.app.live_routes.unwrap_or(true),
             },
             screenshots: ShotConfig {
                 max_width: raw.screenshots.max_width.unwrap_or(1600),

@@ -30,6 +30,10 @@ pub struct Page {
     /// vue (also Vue 2 / Nuxt router pages), filament, blade; "" = vue.
     #[serde(default)]
     pub stack: String,
+    /// The props its route passes (`{kind: "department"}`), read from the running app's router: a shared screen's
+    /// kind picks the API it calls.
+    #[serde(default)]
+    pub props: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -99,6 +103,8 @@ pub struct FactBuilder<'a> {
     page_components: HashMap<(String, PathBuf), usize>,
     /// Module key (see `module_key`) → the spelling every page of it uses (filled by `pages`).
     module_names: HashMap<String, String>,
+    /// The running app's routes, once read.
+    live: Option<Option<Vec<Value>>>,
 }
 
 impl<'a> FactBuilder<'a> {
@@ -137,7 +143,19 @@ impl<'a> FactBuilder<'a> {
             filament: HashMap::new(),
             page_components: HashMap::new(),
             module_names: HashMap::new(),
+            live: None,
         }
+    }
+
+    /// The running app's routes (see `shots::live_routes`), kept in a cache until a route file changes; None when
+    /// the app has no base_url, is not running and nothing is cached, or `[app] live_routes = false`.
+    fn live_routes(&mut self) -> Option<Vec<Value>> {
+        if let Some(r) = &self.live {
+            return r.clone();
+        }
+        let r = live_routes_cached(self.cfg);
+        self.live = Some(r.clone());
+        r
     }
 
     fn app_dir(&self, app: &str) -> PathBuf {
@@ -196,6 +214,57 @@ impl<'a> FactBuilder<'a> {
                         module,
                         portal: String::new(),
                         stack: stack.into(),
+                        props: Default::default(),
+                    },
+                );
+            }
+        }
+        // routes the running app's router registers that its route files do not show (built by helper functions),
+        // and every route's props
+        if let Some(live) = self.live_routes() {
+            let frontends = self.cfg.frontends.clone();
+            let mut by_name: HashMap<String, (String, String)> = HashMap::new();
+            for r in live {
+                let path = r["path"].as_str().unwrap_or_default().to_string();
+                if r["redirect"] == true || r["alias"] == true || path.is_empty() || is_catch_all(&path) {
+                    continue;
+                }
+                let route_name = r["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
+                let key = route_name.clone().unwrap_or_else(|| path.clone());
+                let props: BTreeMap<String, String> = r["props"]
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(known) = all.iter_mut().find(|o| o.key == key) {
+                    known.props = props;
+                    continue;
+                }
+                let found = r["file"].as_str().and_then(|f| app_file(&frontends, f)).or_else(|| {
+                    let name = r["component"].as_str()?;
+                    if by_name.is_empty() {
+                        by_name = vue_files_by_name(&frontends);
+                    }
+                    by_name.get(name).cloned()
+                });
+                let Some((app, file)) = found else { continue };
+                let module = module_for(&self.menu, route_name.as_deref().unwrap_or_default(), &path)
+                    .unwrap_or_else(|| module_from_path(&path));
+                push(
+                    &mut all,
+                    Page {
+                        key,
+                        app,
+                        path,
+                        route_name,
+                        component: PathBuf::from(file),
+                        module,
+                        portal: String::new(),
+                        stack: "vue".into(),
+                        props,
                     },
                 );
             }
@@ -236,6 +305,7 @@ impl<'a> FactBuilder<'a> {
                     module,
                     portal: String::new(),
                     stack: "filament".into(),
+                    props: Default::default(),
                 },
             );
         }
@@ -271,6 +341,7 @@ impl<'a> FactBuilder<'a> {
                     module,
                     portal: String::new(),
                     stack: "blade".into(),
+                    props: Default::default(),
                 },
             );
         }
@@ -514,12 +585,18 @@ impl<'a> FactBuilder<'a> {
         // its kind from the page key: `'department': {...}`) gives the base paths; the page's own files are read
         // whole. Template paths that start with a field of that object (`${c.endpoint}/…`) are joined to its value.
         // These calls are possible, not certain.
-        let hints: Vec<String> = page
+        // the route's own props first (`{kind: "department"}`), then the words of its key
+        let mut hints: Vec<String> = page
             .key
             .split(['.', '/'])
             .filter(|w| !w.is_empty() && !GENERIC_KEY_WORDS.contains(w))
             .map(String::from)
             .collect();
+        for v in page.props.values() {
+            if !v.is_empty() && !v.contains(' ') && !hints.contains(v) {
+                hints.push(v.clone());
+            }
+        }
         let texts: Vec<(String, String)> = code_files
             .iter()
             .chain(scan_files_list.iter())
@@ -986,6 +1063,118 @@ pub fn shows_api_messages(cfg: &Config, f: &PageFacts) -> bool {
     f.code_files
         .iter()
         .any(|c| std::fs::read_to_string(root.join(c)).is_ok_and(|t| MSG.is_match(&t)))
+}
+
+/// A component file as the app's router names it (`/src/pages/X.vue`, `/app/src/pages/X.vue`) → (app, path in it).
+fn app_file(frontends: &[PathBuf], file: &str) -> Option<(String, String)> {
+    let file = file.split('?').next().unwrap_or_default().trim_start_matches('/');
+    let mut tries = vec![file.to_string()];
+    let mut rest = file;
+    while let Some(i) = rest.find("src/") {
+        tries.push(rest[i..].to_string());
+        rest = &rest[i + 4..];
+    }
+    for fe in frontends {
+        for t in &tries {
+            if fe.join(t).is_file() {
+                return Some((Config::repo_name(fe), t.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Every .vue file of the frontends by component name (its file stem) → (app, path).
+fn vue_files_by_name(frontends: &[PathBuf]) -> HashMap<String, (String, String)> {
+    fn walk(dir: &Path, root: &Path, app: &str, out: &mut HashMap<String, (String, String)>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if name != "node_modules" && !name.starts_with('.') && name != "dist" {
+                    walk(&p, root, app, out);
+                }
+            } else if let Some(stem) = name.strip_suffix(".vue") {
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+                out.entry(stem.to_string()).or_insert((app.to_string(), rel));
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for fe in frontends {
+        walk(&fe.join("src"), fe, &Config::repo_name(fe), &mut out);
+    }
+    out
+}
+
+/// The running app's routes, from the cache while the route files are unchanged, else read again (doctest's own
+/// tests only read the cache).
+fn live_routes_cached(cfg: &Config) -> Option<Vec<Value>> {
+    if cfg.app.base_url.is_empty() || !cfg.app.live_routes {
+        return None;
+    }
+    let path = if cfg!(test) {
+        cfg.out.join(".doctest/cache/routes.json")
+    } else {
+        let id = crate::hash::sha256(&cfg.root.to_string_lossy());
+        crate::reports::tool_root()
+            .join("cache")
+            .join(&id[..12])
+            .join("routes.json")
+    };
+    let key = routes_key(cfg);
+    let cached: Option<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    if let Some(c) = &cached
+        && c["key"] == key.as_str()
+    {
+        return c["routes"].as_array().cloned();
+    }
+    if cfg!(test) {
+        return cached.and_then(|c| c["routes"].as_array().cloned());
+    }
+    match crate::shots::live_routes(cfg) {
+        Ok(routes) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, serde_json::json!({"key": key, "routes": routes}).to_string());
+            Some(routes)
+        }
+        // the app is not running: the last list read, if any
+        Err(_) => cached.and_then(|c| c["routes"].as_array().cloned()),
+    }
+}
+
+/// What the route list depends on: the app's address and the route files (name, size, time) of every frontend.
+fn routes_key(cfg: &Config) -> String {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if p.is_dir() {
+                if name != "node_modules" && !name.starts_with('.') && name != "dist" {
+                    walk(&p, out);
+                }
+            } else if name.contains("route") || p.parent().is_some_and(|d| d.ends_with("router")) {
+                let m = std::fs::metadata(&p).ok();
+                let t = m
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                out.push(format!("{}:{}:{t}", p.display(), m.map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+    }
+    let mut parts = vec![cfg.app.base_url.clone(), crate::update::LONG_VERSION.to_string()];
+    for fe in &cfg.frontends {
+        walk(&fe.join("src"), &mut parts);
+    }
+    parts.sort();
+    crate::hash::sha256(&parts.join("\n"))
 }
 
 /// Words of a page key that say what kind of screen it is, not what it shows.
@@ -1945,7 +2134,7 @@ fn walk_menu(node: &Node, module: &str, group: &str, out: &mut Vec<MenuEntry>) {
 /// Prefix of the current fingerprint format; fingerprints without it were made by an older doctest. Bump it whenever
 /// doctest reads pages differently (new kinds of screen text, better endpoint attribution), so guides that were up
 /// to date carry over instead of all turning stale.
-pub const FINGERPRINT_VERSION: &str = "v3:";
+pub const FINGERPRINT_VERSION: &str = "v4:";
 
 /// What a page's guide depends on: what the user sees (path, labels, literal texts, menu path) and what its actions
 /// do (endpoints with their rules, permissions and messages). doctest's own bookkeeping (code files, components,
@@ -2031,6 +2220,47 @@ pub(crate) mod tests {
         assert_eq!(pages[0].module, "orders");
         assert_eq!(pages[0].app, "web");
         assert_eq!(pages[0].component, PathBuf::from("src/pages/ShopOrderForm.vue"));
+    }
+
+    #[test]
+    fn routes_the_running_app_registers_are_pages_too() {
+        let (_d, mut cfg, mut api, labels) = setup();
+        cfg.app.base_url = "http://127.0.0.1:1".into();
+        let web = cfg.frontends[0].clone();
+        std::fs::create_dir_all(web.join("src/pages/params")).unwrap();
+        std::fs::write(
+            web.join("src/pages/params/ParameterList.vue"),
+            "<template><h1>Parameters</h1></template>",
+        )
+        .unwrap();
+        // what the router answered last time (doctest's tests read only the cache)
+        let routes = serde_json::json!([
+            {"name": "shop.orders.create", "path": "/shop/orders/create", "file": "/src/pages/ShopOrderForm.vue", "props": {"kind": "order"}},
+            {"name": "shop.parameter.colour", "path": "/shop/parameter/colour", "file": null, "component": "ParameterList", "props": {"kind": "colour"}},
+            {"name": "shop.parameter.size", "path": "/shop/parameter/size", "file": "/app/src/pages/params/ParameterList.vue", "props": {"kind": "size"}},
+            {"name": "shop.old", "path": "/shop/old", "redirect": true, "file": "/src/pages/ShopOrderForm.vue"},
+            {"name": "shop.gone", "path": "/shop/gone", "file": "/src/pages/Missing.vue"}
+        ]);
+        let cache = cfg.out.join(".doctest/cache/routes.json");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, serde_json::json!({"key": "old", "routes": routes}).to_string()).unwrap();
+        let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
+        let pages = fb.pages().unwrap();
+        let keys: Vec<&str> = pages.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys.len(), 3, "{keys:?}");
+        let colour = pages.iter().find(|p| p.key == "shop.parameter.colour").unwrap();
+        assert_eq!(colour.component, PathBuf::from("src/pages/params/ParameterList.vue"));
+        assert_eq!(colour.props["kind"], "colour");
+        let size = pages.iter().find(|p| p.key == "shop.parameter.size").unwrap();
+        assert_eq!(size.component, PathBuf::from("src/pages/params/ParameterList.vue"));
+        assert_eq!(
+            pages.iter().find(|p| p.key == "shop.orders.create").unwrap().props["kind"],
+            "order"
+        );
+        // switched off
+        cfg.app.live_routes = false;
+        let mut fb = FactBuilder::new(&mut api, &cfg, &labels);
+        assert_eq!(fb.pages().unwrap().len(), 1);
     }
 
     #[test]
@@ -2567,6 +2797,7 @@ const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 
                 module: "m".into(),
                 portal: String::new(),
                 stack: String::new(),
+                props: Default::default(),
             },
             labels: BTreeMap::from([("en".to_string(), vec!["B".to_string(), "A".to_string()])]),
             literals: vec!["Save".into()],

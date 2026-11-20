@@ -339,6 +339,7 @@ mod tests {
                 module: "orders".into(),
                 portal: String::new(),
                 stack: String::new(),
+                props: Default::default(),
             },
             labels: BTreeMap::from([
                 ("en".to_string(), vec!["Tenant".to_string(), "Email".to_string()]),

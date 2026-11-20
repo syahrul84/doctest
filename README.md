@@ -142,6 +142,10 @@ itself, several browsers at once and with no AI involved, and puts it in each la
 handed out once every guide and translation is written. Adding a screenshot to a guide does not make its
 translations stale. `shoot` sends the image back only with `show: true`, and refuses a blank image.
 
+The page list comes from codemap and from the running app's router (headless Chrome reads `getRoutes()`), so
+routes that helper functions build are found too; each page also gets its route props (a shared screen's `kind`).
+The list is cached until a route file changes; `[app] live_routes = false` turns this off.
+
 Every shot uses the same colour scheme (`[screenshots] color_scheme = "light"`, or `dark`, or `auto`), a sign-in page
 of any portal counts as "not signed in", and `shoot_pages` refuses a picture that several pages share.
 

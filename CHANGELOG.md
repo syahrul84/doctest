@@ -6,6 +6,10 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- Pages from the running app's router: routes that helper functions build (`...pair({...})`) are pages too, and
+  every page gets its route props (`{kind: "department"}`), which pick a shared screen's API. Read once with headless
+  Chrome and cached until a route file changes; `[app] live_routes = false` turns it off.
+
 - claim: `kinds` narrow the queue instead of widening it (`shot`/`shots` both mean screenshot items); a page's
   screenshot item waits only for its own guide and translations; an empty answer rebuilds the queue once; an item
   whose page doctest no longer lists leaves the queue; writing a process guide answers the process suggestion.

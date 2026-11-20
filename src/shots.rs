@@ -623,6 +623,78 @@ pub fn shrink_all(cfg: &Config) -> Result<Shrunk, String> {
     })
 }
 
+/// Reads every route the running app's router registers (Vue Router 4 `getRoutes()`, Vue Router 3 the same or its
+/// route tree): name, full path, component file (from `__file`, or the path in a lazy `import("/src/…")`), component
+/// name, props given as an object, and whether it redirects or is an alias. Routes that helper functions build are
+/// found too, which reading the route files cannot do.
+pub fn live_routes(cfg: &Config) -> Result<Vec<serde_json::Value>, String> {
+    let chrome = chrome_path().ok_or("Chrome not found; install Google Chrome or set CHROME_PATH")?;
+    if cfg.app.base_url.is_empty() {
+        return Err("[app] base_url is not set".into());
+    }
+    let (_browser, tab) = launch(&chrome, true, None, CALL_TIMEOUT)?;
+    let start = if cfg.app.login_url.is_empty() {
+        "/"
+    } else {
+        cfg.app.login_url.as_str()
+    };
+    open(&tab, &format!("{}{start}", cfg.app.base_url))?;
+    settle(&tab, Duration::from_secs(10));
+    const JS: &str = r#"(function(){
+  var els = document.querySelectorAll('*'), router = null;
+  for (var i = 0; i < els.length && !router; i++) {
+    var e = els[i];
+    if (e.__vue_app__) router = e.__vue_app__.config.globalProperties.$router;
+    else if (e.__vue__ && e.__vue__.$root && e.__vue__.$root.$router) router = e.__vue__.$root.$router;
+  }
+  if (!router) return JSON.stringify({error: 'no Vue router found on the page'});
+  function comp(c) {
+    if (!c) return {};
+    if (typeof c === 'function' && !c.__file && !c.setup && !c.render && !c.options) {
+      var m = String(c).match(/import\(\s*["'`]([^"'`]+)["'`]/);
+      return {file: m ? m[1] : null};
+    }
+    var o = c.options || c;
+    return {file: o.__file || null, name: o.name || o.__name || null};
+  }
+  function props(p) {
+    var d = p && (p.default !== undefined ? p.default : p);
+    if (!d || typeof d !== 'object') return {};
+    var out = {};
+    Object.keys(d).forEach(function(k){ var v = d[k]; if (['string','number','boolean'].indexOf(typeof v) >= 0) out[k] = String(v); });
+    return out;
+  }
+  var list = [];
+  if (router.getRoutes) {
+    router.getRoutes().forEach(function(r){
+      var c = comp(r.components && r.components.default);
+      list.push({name: r.name ? String(r.name) : null, path: r.path, file: c.file, component: c.name || null,
+        props: props(r.props), redirect: !!r.redirect, alias: !!r.aliasOf, children: (r.children || []).length});
+    });
+  } else {
+    (function walk(rs, base){ (rs || []).forEach(function(r){
+      var p = r.path.charAt(0) === '/' ? r.path : (base.replace(/\/$/, '') + '/' + r.path);
+      var c = comp(r.component);
+      list.push({name: r.name || null, path: p, file: c.file, component: c.name || null, props: props(r.props),
+        redirect: !!r.redirect, alias: false, children: (r.children || []).length});
+      walk(r.children, p);
+    }); })(router.options.routes, '');
+  }
+  return JSON.stringify({routes: list});
+})()"#;
+    let v = tab
+        .evaluate(JS, false)
+        .map_err(|e| format!("cannot read the app's routes: {e}"))?
+        .value
+        .and_then(|v| v.as_str().map(String::from))
+        .ok_or("cannot read the app's routes")?;
+    let v: serde_json::Value = serde_json::from_str(&v).map_err(|e| e.to_string())?;
+    if let Some(e) = v["error"].as_str() {
+        return Err(e.to_string());
+    }
+    Ok(v["routes"].as_array().cloned().unwrap_or_default())
+}
+
 /// `doctor`: opens the app's first page in headless Chrome, as screenshots will. Returns the URL it ended on and
 /// how long it took.
 pub fn probe(cfg: &Config) -> Result<(String, f64), String> {
