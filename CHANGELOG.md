@@ -6,6 +6,17 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- Shared screens: a route's props (`kind`) flow down to the components that pass them on; template parts and script
+  branches for another kind (`v-if="kind === 'x'"`, `kind === 'x' ? a() : b()`) and what a parent's boolean props
+  hide (`<List approval />`, `:new-to="approval ? null : …"`) are left out; components only those parts render are
+  not followed; the running router's component wins over the route files'.
+- Endpoints: a shared API module's call counts only when the page calls that function or method
+  (`customerApi.list`); a composable function the page never uses adds nothing; a call matched to a route by its
+  URL's ending is a guess and gives way to the page's own contract, and an address under another kind's contract base
+  is not the page's; base functions (`${base(id)}/x`) and optional parts (`${editing ? `/${id}` : ''}`) are read.
+- Button evidence comes from what the page's templates show (not script strings or generic list shells, which count
+  only through the action props they are given).
+
 - Pages from the running app's router: routes that helper functions build (`...pair({...})`) are pages too, and
   every page gets its route props (`{kind: "department"}`), which pick a shared screen's API. Read once with headless
   Chrome and cached until a route file changes; `[app] live_routes = false` turns it off.

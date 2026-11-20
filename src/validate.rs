@@ -350,6 +350,7 @@ mod tests {
             code_files: vec![],
             endpoints: vec![],
             menu_titles: vec!["Orders".into(), "New Order".into()],
+            screen_texts: Vec::new(),
         }
     }
 
