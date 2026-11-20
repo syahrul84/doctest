@@ -1,6 +1,8 @@
 //! MCP over stdio: the tools Claude uses to keep a project's guides, system document and tests current.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use sha2::Digest;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -386,8 +388,8 @@ impl Server {
                 .unwrap_or_default()
         };
         let portals = strings("portals");
-        let mut kinds = strings("kinds");
-        kinds.extend(work::queue_kinds(s(args, "queue").unwrap_or(""))?);
+        // kinds narrow a queue (both given: only the kinds in both); "shot" and "shots" both mean screenshot items
+        let kinds = work::wanted_kinds(&strings("kinds"), &work::queue_kinds(s(args, "queue").unwrap_or(""))?);
         match name {
             "status" | "plan" => {
                 let mut st = State::load(&p.cfg);
@@ -410,50 +412,65 @@ impl Server {
                     .ok_or("worker is required (any name, e.g. w1)")?
                     .to_string();
                 let count = args.get("count").and_then(Value::as_u64).unwrap_or(5) as usize;
-                let refresh = args.get("refresh").and_then(Value::as_bool).unwrap_or(false)
-                    || State::load(&p.cfg).queue.is_empty();
-                if refresh {
+                let redo = args.get("redo").and_then(Value::as_bool).unwrap_or(false);
+                // the whole plan is queued; each worker takes only what its queue, kinds and portals allow
+                let rebuild = |p: &mut Project| -> Result<(), String> {
                     let mut st = State::load(&p.cfg);
                     let mut plan = run_plan(&factory, p, &mut st, &scope, progress)?;
-                    if args.get("redo").and_then(Value::as_bool).unwrap_or(false) {
+                    if redo {
                         work::add_redo(&mut plan, &p.cfg, &st);
                     }
-                    // the whole plan is queued; each worker takes only what its queue, kinds and portals allow
                     let ip = work::item_portals(&plan, &st, &p.cfg);
-                    let items: Vec<&work::WorkItem> = plan.items.iter().collect();
                     State::update(&p.cfg, |s| {
-                        s.queue = items.iter().map(|i| i.id.clone()).collect();
-                        s.reasons = items.iter().map(|i| (i.id.clone(), i.reason.clone())).collect();
+                        s.queue = plan.items.iter().map(|i| i.id.clone()).collect();
+                        s.reasons = plan.items.iter().map(|i| (i.id.clone(), i.reason.clone())).collect();
                         s.item_portals = ip.clone();
                         let q = s.queue.clone();
                         s.claims.retain(|k, _| q.contains(k));
-                    })?;
+                    })
+                };
+                let take = |p: &mut Project| {
+                    State::update(&p.cfg, |s| {
+                        let ip = s.item_portals.clone();
+                        // text first: a page's screenshot item waits until its own guide and translations are written
+                        let writing: BTreeSet<String> = s
+                            .queue
+                            .iter()
+                            .filter(|id| id.starts_with("guide:") || id.starts_with("translation:"))
+                            .filter_map(|id| id.splitn(3, ':').nth(2).map(String::from))
+                            .collect();
+                        let wanted = |id: &str| {
+                            work::item_wanted(id, &kinds, &portals, &ip)
+                                && !id.strip_prefix("shots:").is_some_and(|k| writing.contains(k))
+                        };
+                        let got: Vec<(String, String)> = s
+                            .claim_where(&worker, count, crate::state::now(), &wanted)
+                            .into_iter()
+                            .map(|id| {
+                                let r = s.reasons.get(&id).cloned().unwrap_or_default();
+                                (id, r)
+                            })
+                            .collect();
+                        let left = s.queue.iter().filter(|id| wanted(id)).count();
+                        (got, left)
+                    })
+                };
+                let refreshed = args.get("refresh").and_then(Value::as_bool).unwrap_or(false)
+                    || State::load(&p.cfg).queue.is_empty();
+                if refreshed {
+                    rebuild(p)?;
                 }
-                let (got, left) = State::update(&p.cfg, |s| {
-                    let ip = s.item_portals.clone();
-                    // text first: screenshot items wait until every guide and translation is written
-                    let writing = s
-                        .queue
-                        .iter()
-                        .any(|id| id.starts_with("guide:") || id.starts_with("translation:"));
-                    let wanted = |id: &str| {
-                        work::item_wanted(id, &kinds, &portals, &ip) && !(writing && id.starts_with("shots:"))
-                    };
-                    let got: Vec<(String, String)> = s
-                        .claim_where(&worker, count, crate::state::now(), &wanted)
-                        .into_iter()
-                        .map(|id| {
-                            let r = s.reasons.get(&id).cloned().unwrap_or_default();
-                            (id, r)
-                        })
-                        .collect();
-                    let left = s.queue.iter().filter(|id| wanted(id)).count();
-                    (got, left)
-                })?;
+                let (mut got, mut left) = take(p)?;
+                // nothing left for this filter in the queue: items written since it was built (new translations) may
+                // have made new work, so build it again once before saying so
+                if got.is_empty() && !refreshed {
+                    rebuild(p)?;
+                    (got, left) = take(p)?;
+                }
                 let note = if got.iter().any(|(id, _)| id.starts_with("shots:")) {
                     "screenshot items: if shoot_pages has not run since the guides were written, call it once first (it takes every page's opening shot); then per item take only the shots still missing (facts → shoot → write_doc for each language); claims expire after 30 minutes"
                 } else {
-                    "work these items (facts → write_doc / write_test; guides are written without screenshots); a written item leaves the queue; screenshot items come when every guide and translation is written; claims expire after 30 minutes"
+                    "work these items (facts → write_doc / write_test; guides are written without screenshots); a written item leaves the queue; a page's screenshot item comes once its guide and translations are written; claims expire after 30 minutes"
                 };
                 text(pretty(
                     &json!({"worker": worker, "items": got.iter().map(|(id, r)| json!({"id": id, "reason": r})).collect::<Vec<_>>(), "queued": left, "note": note}),
@@ -1188,6 +1205,80 @@ fn module_facts(
     }))
 }
 
+/// A Laravel app's background work read from its files: queued job classes (app/Jobs, ShouldQueue), artisan
+/// commands (app/Console/Commands: signature and description) and the schedule lines (routes/console.php,
+/// app/Console/Kernel.php).
+fn background_work(backend: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
+    fn php_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                php_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "php") {
+                out.push(p);
+            }
+        }
+    }
+    let class = regex::Regex::new(r"(?m)^\s*(?:final\s+|abstract\s+)?class\s+(\w+)").expect("regex");
+    let field = |name: &str| {
+        regex::Regex::new(&format!(
+            r#"(?s)\$\s*{name}\s*=\s*(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")"#
+        ))
+        .expect("regex")
+    };
+    let (signature, description) = (field("signature"), field("description"));
+    let rel = |p: &Path| p.strip_prefix(backend).unwrap_or(p).display().to_string();
+    let mut files = Vec::new();
+    php_files(&backend.join("app/Jobs"), &mut files);
+    files.sort();
+    let jobs: Vec<Value> = files
+        .iter()
+        .filter_map(|f| {
+            let t = std::fs::read_to_string(f).ok()?;
+            let c = class.captures(&t)?;
+            Some(json!({"class": &c[1], "file": rel(f), "queued": t.contains("ShouldQueue")}))
+        })
+        .collect();
+    let mut files = Vec::new();
+    php_files(&backend.join("app/Console/Commands"), &mut files);
+    files.sort();
+    let text_of = |c: Option<regex::Captures>| {
+        c.and_then(|c| {
+            c.get(1)
+                .or(c.get(2))
+                .map(|m| m.as_str().split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+    };
+    let commands: Vec<Value> = files
+        .iter()
+        .filter_map(|f| {
+            let t = std::fs::read_to_string(f).ok()?;
+            let c = class.captures(&t)?;
+            Some(json!({
+                "class": &c[1],
+                "file": rel(f),
+                "signature": text_of(signature.captures(&t)),
+                "description": text_of(description.captures(&t)),
+            }))
+        })
+        .collect();
+    let mut schedule = Vec::new();
+    for f in ["routes/console.php", "app/Console/Kernel.php", "bootstrap/app.php"] {
+        let Ok(t) = std::fs::read_to_string(backend.join(f)) else {
+            continue;
+        };
+        for (i, line) in t.lines().enumerate() {
+            let l = line.trim();
+            if (l.contains("->command(") || l.contains("->job(") || l.contains("Schedule::") || l.contains("->call("))
+                && !l.starts_with("//")
+            {
+                schedule.push(format!("{f}:{}: {l}", i + 1));
+            }
+        }
+    }
+    (jobs, commands, schedule)
+}
+
 /// `kind:lang:rest` → (kind, lang, rest); `doc:x` → ("doc", "", x); `shot:id`, `tests:target`.
 fn split_item(item: &str) -> Result<(&str, &str, &str), String> {
     let (kind, rest) = item.split_once(':').ok_or_else(|| format!("bad item {item}"))?;
@@ -1298,7 +1389,7 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
             let page = pages
                 .iter()
                 .find(|x| x.key == key)
-                .ok_or_else(|| format!("no page {key}"))?;
+                .ok_or_else(|| no_page(&cfg, item, key))?;
             let f = fb.facts(page)?;
             let page = &f.page;
             let path = source::guide_path(lang, &page.portal, &page.module, &page.key);
@@ -1369,7 +1460,7 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 .map(|s| json!({"page": s.fm.routes.first(), "title": s.fm.title, "summary": s.fm.summary, "path": s.path}))
                 .collect();
             Ok(pretty(
-                &json!({"item": item, "source_path_hint": format!("guide/{lang}/<module>/process-{key}.md"), "front_matter": "kind: process, routes: [the pages in order], covers: [other pages it touches]", "menu": menu, "page_guides": guides}),
+                &json!({"item": item, "how": if key == "suggest" { format!("pick the processes worth a guide from the menu groups (a task that crosses several pages) and write each with write_doc item process:{lang}:<slug>; writing any one completes this suggestion") } else { "write the process guide with write_doc for this item".to_string() }, "source_path_hint": format!("guide/{lang}/<module>/process-{key}.md"), "front_matter": "kind: process, routes: [the pages in order], covers: [other pages it touches]", "menu": menu, "page_guides": guides}),
             ))
         }
         "doc" => {
@@ -1386,7 +1477,18 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
             let extra = if key == "system/database" {
                 fb.api().call(BACKEND, "get_schema", json!({}))?.data
             } else if key == "system/jobs" {
-                fb.api().call(BACKEND, "get_schema", json!({"background": true}))?.data
+                let mut d = fb.api().call(BACKEND, "get_schema", json!({"background": true}))?.data;
+                // the queued jobs, artisan commands and schedule straight from the app's folders, in case the index
+                // above lists only some of them
+                let (jobs, commands, schedule) = background_work(&cfg.backend);
+                if let Some(o) = d.as_object_mut() {
+                    o.insert("queued_jobs".into(), json!(jobs));
+                    o.insert("commands".into(), json!(commands));
+                    o.insert("schedule".into(), json!(schedule));
+                } else {
+                    d = json!({"index": d, "queued_jobs": jobs, "commands": commands, "schedule": schedule});
+                }
+                d
             } else if key == "system/architecture" {
                 fb.api()
                     .call(BACKEND, "project_overview", json!({"detail": "full"}))?
@@ -1432,7 +1534,7 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
             let page = pages
                 .iter()
                 .find(|x| x.key == key)
-                .ok_or_else(|| format!("no page {key}"))?;
+                .ok_or_else(|| no_page(&cfg, item, key))?;
             let f = fb.facts(page)?;
             let acts = crate::pages::actions(&f);
             let st = State::load(&cfg);
@@ -1500,7 +1602,7 @@ fn source_path_for(
             let page = pages
                 .iter()
                 .find(|p| p.key == key)
-                .ok_or_else(|| format!("no page {key}"))?;
+                .ok_or_else(|| no_page(cfg, &format!("guide:{lang}:{key}"), key))?;
             let module = fm_module.unwrap_or(&page.module);
             source::guide_path(lang, &page.portal, module, key)
         }
@@ -1638,6 +1740,10 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
         if let Some(s) = &shots_done {
             st.done(s);
         }
+        // the suggestion to write process guides is answered by writing one
+        if kind == "process" {
+            st.done(&format!("process:{lang}:suggest"));
+        }
         st.clone()
     })?;
     let r = crate::html::build(&cfg, &source::sources(&cfg)?, &st)?;
@@ -1661,6 +1767,19 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
             format!("\nwarnings:\n- {}", warnings.join("\n- "))
         }
     ))
+}
+
+/// A queued item whose page doctest no longer lists (a route container, a route shadowed by an earlier one with the
+/// same path, an excluded page): it leaves the queue, and the answer says so.
+fn no_page(cfg: &Config, item: &str, key: &str) -> String {
+    let _ = State::update(cfg, |st| {
+        st.queue.retain(|q| q != item);
+        st.claims.remove(item);
+        st.reasons.remove(item);
+    });
+    format!(
+        "no page {key}: doctest does not document it (a route that only holds child pages, a route whose path an earlier route already shows, or an excluded page) — {item} was removed from the queue; claim the next item"
+    )
 }
 
 /// The marker the guide skeleton leaves where the page's opening screenshot goes.
@@ -1810,10 +1929,34 @@ fn shoot_pages(p: &mut Project, args: &Value, progress: &dyn crate::progress::Pr
         }
     });
     let results = results.into_inner().expect("results");
-    let failed: BTreeMap<String, String> = results
+    let mut failed: BTreeMap<String, String> = results
         .iter()
         .filter_map(|(k, r)| r.as_ref().err().map(|e| (k.clone(), e.clone())))
         .collect();
+    // the same picture for several different pages is a sign-in, error or empty page, not those pages
+    let mut by_image: BTreeMap<String, Vec<(String, PathBuf)>> = BTreeMap::new();
+    for (k, r) in &results {
+        if let Ok(shot) = r
+            && let Ok(bytes) = std::fs::read(&shot.path)
+        {
+            by_image
+                .entry(crate::hash::hex(&sha2::Sha256::digest(&bytes)))
+                .or_default()
+                .push((k.clone(), shot.path.clone()));
+        }
+    }
+    for same in by_image.values().filter(|v| v.len() >= 3) {
+        for (k, path) in same {
+            let _ = std::fs::remove_file(path);
+            failed.insert(
+                k.clone(),
+                format!(
+                    "the screenshot is identical to {} other pages' (likely a sign-in, error or empty page): not used — check the page or its portal's sign-in (login), then shoot it",
+                    same.len() - 1
+                ),
+            );
+        }
+    }
     // put each image in every language's guide
     let root = source::source_root(&cfg);
     let mut placed = 0;
@@ -2404,6 +2547,39 @@ mod tests {
         // a second run finds nothing left to take
         let (text, _) = call(&mut s, "shoot_pages", json!({"project": cfg.root}));
         assert!(text.starts_with("0 page(s)"), "{text}");
+    }
+
+    #[test]
+    fn background_work_comes_from_the_app_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let b = d.path();
+        std::fs::create_dir_all(b.join("app/Jobs/Tax")).unwrap();
+        std::fs::create_dir_all(b.join("app/Console/Commands")).unwrap();
+        std::fs::create_dir_all(b.join("routes")).unwrap();
+        std::fs::write(
+            b.join("app/Jobs/Tax/SubmitTax.php"),
+            "<?php\nclass SubmitTax implements ShouldQueue {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("app/Console/Commands/Renew.php"),
+            "<?php\nclass Renew extends Command {\n protected $signature = 'tenancy:renew\n   {--dry}';\n protected $description = \"Renews tenancies\";\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("routes/console.php"),
+            "<?php\nSchedule::command('tenancy:renew')->daily();\n// Schedule::command('old')\n",
+        )
+        .unwrap();
+        let (jobs, commands, schedule) = background_work(b);
+        assert_eq!(jobs[0]["class"], "SubmitTax");
+        assert_eq!(jobs[0]["queued"], true);
+        assert_eq!(commands[0]["signature"], "tenancy:renew {--dry}");
+        assert_eq!(commands[0]["description"], "Renews tenancies");
+        assert_eq!(
+            schedule,
+            vec!["routes/console.php:2: Schedule::command('tenancy:renew')->daily();"]
+        );
     }
 
     #[test]

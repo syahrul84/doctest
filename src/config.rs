@@ -113,6 +113,9 @@ pub struct ShotConfig {
     pub allow: Vec<String>,
     /// Retake screenshots in every language (default off: translations reuse the primary language's images).
     pub per_language: bool,
+    /// The colour scheme pages are shown in (`light` by default, `dark`, or `auto` to leave it to Chrome), so every
+    /// guide image looks the same.
+    pub color_scheme: String,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +204,7 @@ struct RawShots {
     #[serde(default)]
     allow: Vec<String>,
     per_language: Option<bool>,
+    color_scheme: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -320,6 +324,7 @@ impl Config {
                 safe: raw.screenshots.safe.unwrap_or(true),
                 allow: raw.screenshots.allow,
                 per_language: raw.screenshots.per_language.unwrap_or(false),
+                color_scheme: raw.screenshots.color_scheme.unwrap_or_else(|| "light".into()),
             },
             tests: TestConfig {
                 run,

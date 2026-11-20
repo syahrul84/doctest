@@ -1016,6 +1016,37 @@ pub fn queue_kinds(queue: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// The kinds a claim or status asks for: the `kinds` given, narrowed to the queue's when both are given. "shot",
+/// "shots" and "screenshots" all mean the screenshot items (`shots:<page>` and `shot:<id>`).
+pub fn wanted_kinds(kinds: &[String], queue: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in kinds {
+        let k = k.trim().trim_end_matches(':').to_lowercase();
+        let names: Vec<String> = match k.as_str() {
+            "shot" | "shots" | "screenshot" | "screenshots" => vec!["shots".into(), "shot".into()],
+            "guides" => vec!["guide".into()],
+            "translations" => vec!["translation".into()],
+            "docs" => vec!["doc".into()],
+            "test" => vec!["tests".into()],
+            _ => vec![k],
+        };
+        for n in names {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    if queue.is_empty() {
+        return out;
+    }
+    if out.is_empty() {
+        return queue.to_vec();
+    }
+    let both: Vec<String> = out.into_iter().filter(|k| queue.contains(k)).collect();
+    // kinds outside the queue: match nothing rather than everything
+    if both.is_empty() { vec!["-".into()] } else { both }
+}
+
 /// Does an item pass a kinds and portals filter? An item of no portal passes any portal filter unless the filter
 /// asks for `only` portal items.
 pub fn item_wanted(
@@ -1316,6 +1347,24 @@ pub(crate) mod tests {
             "{:?}",
             ids(&p)
         );
+    }
+
+    #[test]
+    fn kinds_narrow_the_queue() {
+        let guides = queue_kinds("guides").unwrap();
+        let k = wanted_kinds(&["translation".into()], &guides);
+        assert_eq!(k, vec!["translation".to_string()]);
+        let ip = BTreeMap::new();
+        assert!(item_wanted("translation:id:x", &k, &[], &ip));
+        assert!(!item_wanted("guide:en:x", &k, &[], &ip) && !item_wanted("doc:system/modules/a", &k, &[], &ip));
+        let k = wanted_kinds(&["shot".into()], &guides);
+        assert!(item_wanted("shots:x", &k, &[], &ip) && item_wanted("shot:m/x-1", &k, &[], &ip));
+        assert!(!item_wanted("guide:en:x", &k, &[], &ip));
+        let k = wanted_kinds(&["guide".into(), "process".into(), "doc".into()], &guides);
+        assert!(!item_wanted("translation:id:x", &k, &[], &ip));
+        let k = wanted_kinds(&["tests".into()], &guides);
+        assert!(!item_wanted("guide:en:x", &k, &[], &ip) && !item_wanted("tests:x", &k, &[], &ip));
+        assert_eq!(wanted_kinds(&[], &guides), guides);
     }
 
     #[test]

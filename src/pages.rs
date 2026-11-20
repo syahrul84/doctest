@@ -97,6 +97,8 @@ pub struct FactBuilder<'a> {
     filament: HashMap<String, (String, String)>,
     /// (app, component file) → how many pages render it as their screen.
     page_components: HashMap<(String, PathBuf), usize>,
+    /// Module key (see `module_key`) → the spelling every page of it uses (filled by `pages`).
+    module_names: HashMap<String, String>,
 }
 
 impl<'a> FactBuilder<'a> {
@@ -134,6 +136,7 @@ impl<'a> FactBuilder<'a> {
             portals: cfg.guide.portals.clone(),
             filament: HashMap::new(),
             page_components: HashMap::new(),
+            module_names: HashMap::new(),
         }
     }
 
@@ -307,6 +310,28 @@ impl<'a> FactBuilder<'a> {
                 p
             })
             .collect();
+        // two routes with the same path: only the first registered one ever shows at that URL
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        out.retain(|p| seen.insert((p.app.clone(), same_path(&p.path))));
+        // one module, one folder: names that differ only in punctuation (eform, e-form) take the commonest spelling
+        let mut spellings: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+        for p in &out {
+            *spellings
+                .entry(module_key(&p.module))
+                .or_default()
+                .entry(p.module.clone())
+                .or_default() += 1;
+        }
+        for p in out.iter_mut() {
+            if let Some(best) = spellings.get(&module_key(&p.module)).and_then(|v| {
+                v.iter()
+                    .max_by_key(|(name, n)| (**n, name.contains('-'), std::cmp::Reverse((*name).clone())))
+                    .map(|(name, _)| name.clone())
+            }) {
+                self.module_names.insert(module_key(&best), best.clone());
+                p.module = best;
+            }
+        }
         out.sort_by(|a, b| (&a.module, &a.key).cmp(&(&b.module, &b.key)));
         Ok(out)
     }
@@ -341,6 +366,15 @@ impl<'a> FactBuilder<'a> {
             let text = std::fs::read_to_string(dir.join(&file)).unwrap_or_default();
             literals.extend(template_literals(&text));
             literals.extend(script_literals(&text));
+            // i18n keys the code names in a string anywhere (a lookup map, `cond ? 'a.b' : 'a.c'`, a helper's
+            // argument): their texts can be on screen even when codemap does not see a t() call for them
+            for key in quoted_keys(&text) {
+                for (lang, set) in labels.iter_mut() {
+                    if let Some(t) = self.labels.text(lang, &key) {
+                        set.insert(t.trim().to_string());
+                    }
+                }
+            }
             let pages_using = self
                 .page_components
                 .get(&(page.app.clone(), PathBuf::from(&file)))
@@ -383,8 +417,10 @@ impl<'a> FactBuilder<'a> {
                 }
             }
             for r in c["renders"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                // three levels of the page's own parts; frames that wrap content (a <slot>) are followed further,
+                // so the labels of a layout reached through several frames (Switch, Log out) are the page's too
                 if let Some(target) = arrow_target(r)
-                    && depth < 3
+                    && (depth < 3 || (depth < 6 && text.contains("<slot")))
                     && dir.join(&target).is_file()
                 {
                     // what a layout or shared screen renders is shared too
@@ -430,6 +466,7 @@ impl<'a> FactBuilder<'a> {
         let mut seen = BTreeSet::new();
         let mut endpoints = Vec::new();
         let scan_files_list: Vec<String> = imported.keys().cloned().collect();
+        let imported_names = imported.clone();
         let scan: Vec<(String, Option<BTreeSet<String>>)> = code_files
             .iter()
             .filter(|f| !f.ends_with(".vue") || components.contains(f))
@@ -472,6 +509,66 @@ impl<'a> FactBuilder<'a> {
                 }
             }
         }
+        // API paths built at run time (`${contract.endpoint}/${id}/approve`, a per-kind contract object) are not calls
+        // codemap can match. The object that names this page (its route name, as contracts do with `detailRoute`, or
+        // its kind from the page key: `'department': {...}`) gives the base paths; the page's own files are read
+        // whole. Template paths that start with a field of that object (`${c.endpoint}/…`) are joined to its value.
+        // These calls are possible, not certain.
+        let hints: Vec<String> = page
+            .key
+            .split(['.', '/'])
+            .filter(|w| !w.is_empty() && !GENERIC_KEY_WORDS.contains(w))
+            .map(String::from)
+            .collect();
+        let texts: Vec<(String, String)> = code_files
+            .iter()
+            .chain(scan_files_list.iter())
+            .filter_map(|f| std::fs::read_to_string(dir.join(f)).ok().map(|t| (f.clone(), t)))
+            .collect();
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut candidates: Vec<String> = Vec::new();
+        for (f, text) in &texts {
+            let anchored = page
+                .route_name
+                .as_deref()
+                .and_then(|r| block_naming(text, r))
+                .or_else(|| hints.iter().rev().find_map(|h| keyed_block(text, h)));
+            if let Some(region) = anchored {
+                fields.extend(path_fields(region));
+                candidates.extend(literal_paths(region, text, &hints));
+            } else if certain_files.contains(f) {
+                candidates.extend(literal_paths(text, text, &hints));
+            } else if let Some(Some(names)) = imported_names.get(f) {
+                // an API module the page imports functions from by name: the paths inside those functions
+                candidates.extend(literal_paths_in(text, names, &hints));
+            }
+        }
+        if !fields.is_empty() {
+            for (_, text) in &texts {
+                candidates.extend(joined_paths(text, &fields));
+            }
+        }
+        let mut literal_hits: Vec<(String, String)> = Vec::new();
+        if !candidates.is_empty() {
+            let routes = self.all_routes()?;
+            for lit in &candidates {
+                let mut hits: Vec<(String, String)> = routes
+                    .keys()
+                    .filter(|(m, uri)| m != "HEAD" && path_matches(lit, uri))
+                    .cloned()
+                    .collect();
+                hits.sort();
+                literal_hits.extend(hits);
+            }
+        }
+        for (method, uri) in literal_hits {
+            if seen.insert((method.clone(), uri.clone()))
+                && let Some(mut e) = self.endpoint(&method, &uri)?
+            {
+                e.possible = true;
+                endpoints.push(e);
+            }
+        }
         // shared code (a layout, a shell) can reach another portal's API: those calls are not this page's
         let others: Vec<String> = self
             .portals
@@ -489,7 +586,11 @@ impl<'a> FactBuilder<'a> {
                 .iter()
                 .find(|m| m.route_name == r && !m.aro.is_empty() && perms.contains(&&m.aro))
             {
-                page.module = m.module.clone();
+                page.module = self
+                    .module_names
+                    .get(&module_key(&m.module))
+                    .cloned()
+                    .unwrap_or_else(|| m.module.clone());
             }
         }
         let page = &page;
@@ -798,9 +899,25 @@ fn action_name(e: &Endpoint) -> Option<String> {
         .copied()
         .unwrap_or_default()
         .to_lowercase();
+    // "post" and "copy" are also nouns at the start of a name (post-evaluation, copy-of-lease)
     let named = NAMED_ACTIONS.iter().find(|n| {
-        last_literal == **n || last_literal.starts_with(&format!("{n}-")) || last_literal.ends_with(&format!("-{n}"))
+        last_literal == **n
+            || last_literal.ends_with(&format!("-{n}"))
+            || (!matches!(**n, "post" | "copy") && last_literal.starts_with(&format!("{n}-")))
     });
+    let reads = matches!(e.method.as_str(), "GET" | "HEAD");
+    // a GET only reads: of the named actions only the ones that hand out a file
+    let named = named.filter(|n| !reads || matches!(**n, "export" | "print" | "download" | "pdf" | "xls" | "excel"));
+    // a POST to …/delete-receipt/{id}, or one whose success message says deleted, deletes
+    let deletes = !reads
+        && (segs.iter().filter(|s| !s.starts_with('{')).any(|s| {
+            ["delete", "remove", "destroy"]
+                .iter()
+                .any(|w| s.to_lowercase().contains(w))
+        }) || e
+            .messages
+            .iter()
+            .any(|m| reads_as_success(m) && m.to_lowercase().contains("delet")));
     let title = |s: &str| {
         let s = match s {
             "pdf" | "xls" | "excel" => "export",
@@ -814,6 +931,7 @@ fn action_name(e: &Endpoint) -> Option<String> {
     match (e.method.as_str(), named) {
         (_, Some(n)) => Some(title(n)),
         ("GET" | "HEAD", None) => None,
+        (_, None) if deletes => Some("Delete".into()),
         ("DELETE", None) => Some("Delete".into()),
         ("PUT" | "PATCH", None) => Some("Edit".into()),
         ("POST", None) if segs.last().is_some_and(|s| s.starts_with('{')) => Some("Edit".into()),
@@ -846,9 +964,311 @@ fn reads_as_success(m: &str) -> bool {
 
 /// Does this API path belong to one of these other portals (a path segment named after it, like api/selfcare/…)?
 pub fn of_other_portal(uri: &str, others: &[String]) -> bool {
-    uri.to_lowercase()
-        .split(['/', '.', '-', '_'])
-        .any(|seg| others.iter().any(|o| o == seg))
+    // whole path parts only: `selfcare-menu-configuration` is an admin page's API, `api/selfcare/…` is not
+    uri.to_lowercase().split('/').any(|seg| others.iter().any(|o| o == seg))
+}
+
+/// Does the page show the API's own message (`response.data.message`, `res.message`)? Many pages show their own text
+/// after a save instead; then the API's success message is never on screen. Unknown code counts as yes.
+pub fn shows_api_messages(cfg: &Config, f: &PageFacts) -> bool {
+    static MSG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(?:response|res|resp|result|data|payload|r)\??\.(?:data\??\.)?message\b").unwrap()
+    });
+    if f.code_files.is_empty() {
+        return true;
+    }
+    let root = cfg
+        .frontends
+        .iter()
+        .find(|fe| Config::repo_name(fe) == f.page.app)
+        .cloned()
+        .unwrap_or_else(|| cfg.backend.clone());
+    f.code_files
+        .iter()
+        .any(|c| std::fs::read_to_string(root.join(c)).is_ok_and(|t| MSG.is_match(&t)))
+}
+
+/// Words of a page key that say what kind of screen it is, not what it shows.
+const GENERIC_KEY_WORDS: [&str; 14] = [
+    "admin",
+    "selfcare",
+    "contractor",
+    "view",
+    "listing",
+    "list",
+    "detail",
+    "details",
+    "index",
+    "create",
+    "edit",
+    "new",
+    "show",
+    "form",
+];
+
+/// The innermost object literal that holds the string `needle` (`detailRoute: 'admin.x.view'` inside a contract).
+pub fn block_naming<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
+    let at = ["'", "\"", "`"]
+        .iter()
+        .find_map(|q| text.find(&format!("{q}{needle}{q}")))?;
+    let mut depth = 0i32;
+    let mut open = None;
+    for (i, c) in text[..at].char_indices().rev() {
+        match c {
+            '}' => depth += 1,
+            '{' => {
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let start = open?;
+    let mut depth = 0i32;
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The fields of an object that hold a path: `endpoint: 'admin/eform/delivery'` → endpoint → admin/eform/delivery.
+pub fn path_fields(region: &str) -> BTreeMap<String, String> {
+    static F: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\b(\w+)\s*:\s*['"`]([a-zA-Z][\w\-]*(?:/[\w\-{}]+)+)/?['"`]"#).unwrap());
+    F.captures_iter(region)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+/// Template paths that start with one of these fields (`${contract.endpoint}/${id}/approve`), joined to its value.
+pub fn joined_paths(text: &str, fields: &BTreeMap<String, String>) -> Vec<String> {
+    static T: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`\$\{([^}]+)\}([^`]*)`").unwrap());
+    static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{[^}]*\}").unwrap());
+    let mut out = Vec::new();
+    for c in T.captures_iter(text) {
+        let name = c[1]
+            .trim()
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(['?', ')']);
+        let Some(base) = fields.get(name) else { continue };
+        let tail = VAR.replace_all(&c[2], "{p}");
+        let path = format!("{base}{}", tail.split('?').next().unwrap_or_default())
+            .trim_matches('/')
+            .to_string();
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The object a module keeps for one kind: the `{…}` after `'kind':`, `"kind":`, `kind:` or `['kind']:`.
+pub fn keyed_block<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let re = Regex::new(&format!(
+        r#"(?:['"`]{k}['"`]|\b{k}\b|\[['"`]{k}['"`]\])\s*:\s*\{{"#,
+        k = regex::escape(key)
+    ))
+    .ok()?;
+    let m = re.find(text)?;
+    let start = m.end() - 1;
+    let mut depth = 0i32;
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// API paths written as strings in `region` (`'admin/eform/delivery'`, `` `${base}/${id}/approve` ``), with
+/// `${a.b}` filled from `b: '…'` or `const b = '…'` (in the region first, then the whole file); a part that cannot be
+/// filled becomes a parameter.
+pub fn literal_paths(region: &str, file: &str, kinds: &[String]) -> Vec<String> {
+    static STR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"'([^'\n]*)'|"([^"\n]*)"|`([^`]*)`"#).unwrap());
+    static ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"\b(\w+)\s*(?::|=)\s*(?:'([^'\n]*/[^'\n]*)'|"([^"\n]*/[^"\n]*)"|`([^`$]*/[^`$]*)`)"#).unwrap()
+    });
+    static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{([^}]*)\}").unwrap());
+    let mut values: HashMap<String, String> = HashMap::new();
+    for t in [file, region] {
+        for c in ASSIGN.captures_iter(t) {
+            let v = c
+                .get(2)
+                .or(c.get(3))
+                .or(c.get(4))
+                .map(|m| m.as_str())
+                .unwrap_or_default();
+            values.insert(c[1].to_string(), v.to_string());
+        }
+    }
+    // only strings used as an address: an HTTP call's first argument or a url/endpoint/base field (not ACL names,
+    // menu paths or route paths that only look like one)
+    static USE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:\.(?:get|post|put|patch|delete|request|head)\s*(?:<[^>]*>)?\s*\(\s*|\bfetch\s*\(\s*|\b\w*(?:url|uri|endpoint|base|api)\w*\s*[:=]\s*)$").unwrap()
+    });
+    let mut out = Vec::new();
+    for c in STR.captures_iter(region) {
+        let raw = c
+            .get(1)
+            .or(c.get(2))
+            .or(c.get(3))
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        if !raw.contains('/')
+            || raw.contains(' ')
+            || raw.contains("://")
+            || raw.starts_with('.')
+            || raw.starts_with('@')
+        {
+            continue;
+        }
+        let before = &region[..c.get(0).map(|m| m.start()).unwrap_or(0)];
+        let mut from = before.len().saturating_sub(60);
+        while !before.is_char_boundary(from) {
+            from += 1;
+        }
+        let before = &before[from..];
+        if !USE.is_match(before) {
+            continue;
+        }
+        // `${props.kind}` stands for the page's kind (from its key); one path per kind
+        let by_kind = VAR
+            .captures_iter(raw)
+            .any(|v| matches!(last_ident(&v[1]), "kind" | "type" | "entity" | "resource"));
+        let fills: Vec<Option<&String>> = if by_kind && !kinds.is_empty() {
+            kinds.iter().map(Some).collect()
+        } else {
+            vec![None]
+        };
+        for kind in fills {
+            let filled = VAR.replace_all(raw, |v: &regex::Captures| {
+                let name = last_ident(&v[1]);
+                if let (Some(k), true) = (kind, matches!(name, "kind" | "type" | "entity" | "resource")) {
+                    return k.clone();
+                }
+                values
+                    .get(name)
+                    .filter(|x| !x.contains("${"))
+                    .cloned()
+                    .unwrap_or_else(|| "{p}".to_string())
+            });
+            let path = filled
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_matches('/')
+                .to_string();
+            // a path that starts with an unknown part cannot be placed
+            if path.is_empty() || path.starts_with('{') || path.ends_with(".vue") || path.contains(".ts") {
+                continue;
+            }
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// `props.contract.endpoint` → `endpoint`.
+fn last_ident(expr: &str) -> &str {
+    expr.trim()
+        .rsplit(['.', ' '])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(['?', ')'])
+}
+
+/// The API paths written inside the functions a page imports by name from a module.
+pub fn literal_paths_in(text: &str, functions: &BTreeSet<String>, kinds: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen_fn = BTreeSet::new();
+    for (i, _) in text.lines().enumerate() {
+        if let Some(name) = enclosing_export(text, i + 1)
+            && functions.contains(&name)
+        {
+            seen_fn.insert(name);
+        }
+    }
+    // each function's lines, read as one region
+    let lines: Vec<&str> = text.lines().collect();
+    let mut region = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        if enclosing_export(text, i + 1).is_some_and(|n| seen_fn.contains(&n)) {
+            region.push_str(l);
+            region.push('\n');
+        }
+    }
+    for p in literal_paths(&region, text, kinds) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Does a path written in the frontend name this route? `api/` in front of either is ignored; `{…}` on either side
+/// matches any one part.
+pub fn path_matches(lit: &str, uri: &str) -> bool {
+    let strip = |p: &str| -> Vec<String> {
+        let p = p.trim_matches('/');
+        let p = p.strip_prefix("api/").unwrap_or(p);
+        p.split('/').map(String::from).collect()
+    };
+    let (a, b) = (strip(lit), strip(uri));
+    a.len() == b.len()
+        && a.len() >= 2
+        && a.iter()
+            .zip(&b)
+            .all(|(x, y)| x == y || x.starts_with('{') || y.starts_with('{'))
+        && a.iter().zip(&b).filter(|(x, y)| x == y).count() >= 2
+}
+
+/// Quoted strings that look like i18n keys (`'message.serviceType'`, `"labels.code"`): a dotted or camelCase word.
+pub fn quoted_keys(text: &str) -> Vec<String> {
+    static Q: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"['"`]([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+|[a-z]+[A-Z][A-Za-z0-9]*)['"`]"#).unwrap()
+    });
+    let mut out: Vec<String> = Q.captures_iter(text).map(|c| c[1].to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A module name without case and punctuation: `E-Form`, `eform` and `e_form` are one module.
+pub fn module_key(module: &str) -> String {
+    module
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A route path with its parameter names left out (`/floor-plan/:floorId` and `/floor-plan/:id` are one URL).
+pub fn same_path(path: &str) -> String {
+    static PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r":\w+\??|\{\w+\??\}").unwrap());
+    PARAM.replace_all(path.trim_end_matches('/'), ":p").to_string()
 }
 
 /// A route container: its template is only a place for child pages (`<router-view/>`, maybe inside a transition or a
@@ -950,7 +1370,7 @@ pub fn possible_actions(f: &PageFacts) -> Vec<Action> {
     let certain: Vec<String> = actions(f).into_iter().map(|a| a.name).collect();
     let mut out: Vec<Action> = Vec::new();
     for e in f.endpoints.iter().filter(|e| e.possible) {
-        let Some(name) = action_name(e) else { continue };
+        let Some(name) = page_action_name(f, e) else { continue };
         if certain.contains(&name) || out.iter().any(|a| a.name == name) {
             continue;
         }
@@ -959,12 +1379,39 @@ pub fn possible_actions(f: &PageFacts) -> Vec<Action> {
     out
 }
 
+/// An action's name on this page: a create call on a page that offers no Add/New/Create (a settings page that only
+/// saves, its controller upserting) is the page's Edit.
+fn page_action_name(f: &PageFacts, e: &Endpoint) -> Option<String> {
+    let name = action_name(e)?;
+    if name == "Add" {
+        let page = format!("{} {}", f.page.key, f.page.path).to_lowercase();
+        let creates = shows_words(f, &["new", "add", "create"])
+            || ["create", "new", "add"].iter().any(|w| page.contains(w))
+            || e.messages.iter().any(|m| {
+                let m = m.to_lowercase();
+                m.contains("created") || m.contains("added")
+            });
+        if !creates && shows_words(f, &["save", "update", "submit"]) {
+            return Some("Edit".into());
+        }
+    }
+    Some(name)
+}
+
+fn shows_words(f: &PageFacts, words: &[&str]) -> bool {
+    f.labels.values().flatten().chain(&f.literals).any(|t| {
+        t.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| words.contains(&w))
+    })
+}
+
 /// The page's actions, one per name, in the order of its endpoints: calls its own components make, and calls from
 /// shared code when the page shows a matching button.
 pub fn actions(f: &PageFacts) -> Vec<Action> {
     let mut out: Vec<Action> = Vec::new();
     for e in &f.endpoints {
-        let Some(name) = action_name(e) else { continue };
+        let Some(name) = page_action_name(f, e) else { continue };
         if e.possible && !shows_button(f, &name) {
             continue;
         }
@@ -1819,6 +2266,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn action_names_read_the_path_and_message() {
+        let ep = |m: &str, uri: &str, msgs: &[&str]| Endpoint {
+            method: m.into(),
+            uri: uri.into(),
+            messages: msgs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            action_name(&ep("POST", "api/ar/delete-receipt/{receiptId}", &[])).as_deref(),
+            Some("Delete")
+        );
+        assert_eq!(
+            action_name(&ep("POST", "api/ar/receipt/{id}", &["Record successfully deleted."])).as_deref(),
+            Some("Delete")
+        );
+        assert_eq!(
+            action_name(&ep("GET", "api/site-post-evaluation/{id}", &[])),
+            None,
+            "a GET does not post"
+        );
+        assert_eq!(
+            action_name(&ep("POST", "api/site-post-evaluation/{id}", &[])).as_deref(),
+            Some("Edit")
+        );
+        assert_eq!(
+            action_name(&ep("POST", "api/journal/{id}/post", &[])).as_deref(),
+            Some("Post")
+        );
+        assert_eq!(
+            action_name(&ep("GET", "api/orders/export", &[])).as_deref(),
+            Some("Export")
+        );
+        // a settings page that only saves: its create call is the page's Edit
+        let mut f: PageFacts = serde_json::from_value(serde_json::json!({
+            "page": {"key": "admin.system.configuration", "app": "web", "path": "/admin/system/configuration", "route_name": "c", "component": "C.vue", "module": "system"},
+            "labels": {"en": ["Save", "Configuration"]}, "literals": [], "components": [], "code_files": [], "endpoints": [], "menu_titles": []
+        }))
+        .unwrap();
+        f.endpoints = vec![ep("POST", "api/system/configuration", &[])];
+        assert_eq!(actions(&f)[0].name, "Edit");
+        f.labels
+            .insert("en".into(), ["New", "Save"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(actions(&f)[0].name, "Add");
+    }
+
+    #[test]
     fn actions_from_endpoints() {
         let mut f = sample();
         f.endpoints = vec![
@@ -1900,6 +2393,76 @@ const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 
     }
 
     #[test]
+    fn only_strings_used_as_addresses_are_paths() {
+        let t = "const aros = { a: 'rems_admin/members' };\nconst menu = ['admin/rems/selfcare/newsletter'];\napi.get('admin/orders/list');\nconst endpoint = 'admin/orders';\nconst ü = 'é'; http.post<Res>(`admin/orders/${id}/approve`)";
+        assert_eq!(
+            literal_paths(t, t, &[]),
+            vec!["admin/orders/list", "admin/orders", "admin/orders/{p}/approve"]
+        );
+    }
+
+    #[test]
+    fn kind_paths_and_imported_functions() {
+        let m = "export async function list(kind) {\n  return api.get(`admin/system/data-setup/${props.kind}`)\n}\nexport async function other() {\n  return api.get('admin/elsewhere/x')\n}\nexport const load = async () => {\n  return api.get('admin/system/system/selfcare-menu-configuration/')\n}\n";
+        let kinds = vec!["department".to_string()];
+        assert_eq!(literal_paths(m, m, &kinds)[0], "admin/system/data-setup/department");
+        let names: BTreeSet<String> = ["load".to_string()].into_iter().collect();
+        assert_eq!(
+            literal_paths_in(m, &names, &kinds),
+            vec!["admin/system/system/selfcare-menu-configuration"]
+        );
+    }
+
+    #[test]
+    fn contracts_that_name_the_page_give_its_paths() {
+        let contracts = "export const a = {\n  kind: 'delivery',\n  endpoint: 'admin/eform/delivery',\n  detailRoute: 'admin.e-form.delivery.view',\n  statuses: { x: 1 },\n}\nexport const b = { endpoint: 'admin/eform/renovation', detailRoute: 'admin.e-form.renovation.view' }\n";
+        let block = block_naming(contracts, "admin.e-form.delivery.view").unwrap();
+        assert!(
+            block.contains("admin/eform/delivery") && !block.contains("renovation"),
+            "{block}"
+        );
+        let fields = path_fields(block);
+        assert_eq!(fields["endpoint"], "admin/eform/delivery");
+        let logic = "api.put(`${contract.endpoint}/${id}/approve`); api.get(`${props.contract.endpoint}/${id}`); api.get(`${other}/x`)";
+        assert_eq!(
+            joined_paths(logic, &fields),
+            vec!["admin/eform/delivery/{p}/approve", "admin/eform/delivery/{p}"]
+        );
+    }
+
+    #[test]
+    fn api_paths_built_at_run_time_are_read() {
+        let file = "export const contracts = {\n  'department': { base: 'admin/asset/department', label: 'x' },\n  'customer': { base: 'admin/asset/customer' },\n}\nexport function save(c, id) { return api.post(`${c.base}/${id}`) }\nconst root = 'admin/eform/delivery';\nconst approve = (id) => api.put(`${root}/${id}/approve`);\n";
+        let block = keyed_block(file, "department").unwrap();
+        assert!(
+            block.contains("admin/asset/department") && !block.contains("customer"),
+            "{block}"
+        );
+        assert_eq!(literal_paths(block, file, &[]), vec!["admin/asset/department"]);
+        let all = literal_paths(file, file, &[]);
+        assert!(all.contains(&"admin/eform/delivery/{p}/approve".to_string()), "{all:?}");
+        assert!(!all.iter().any(|p| p.starts_with('{')), "{all:?}");
+        assert!(path_matches(
+            "admin/eform/delivery/{p}/approve",
+            "api/admin/eform/delivery/{delivery}/approve"
+        ));
+        assert!(path_matches("admin/asset/department", "api/admin/asset/department"));
+        assert!(!path_matches("admin/asset/department", "api/admin/asset/customer"));
+        assert!(!path_matches("{p}/x", "api/a/x"), "too little in common");
+    }
+
+    #[test]
+    fn quoted_i18n_keys_are_found() {
+        let k = quoted_keys(
+            "t(isFooter ? 'message.footer' : 'message.header'); const m = {a: \"labels.serviceType\", b: 'deviceType'}; x('plain words', 'id')",
+        );
+        assert_eq!(
+            k,
+            vec!["deviceType", "labels.serviceType", "message.footer", "message.header"]
+        );
+    }
+
+    #[test]
     fn route_containers_are_not_pages() {
         assert!(is_container("<template><router-view /></template>"));
         assert!(is_container(
@@ -1920,7 +2483,10 @@ const x = { label: 'booking.title', text: 'msg_key', header: 'id', placeholder: 
     fn another_portals_api_is_not_the_pages() {
         let others = vec!["selfcare".to_string(), "contractor".to_string()];
         assert!(of_other_portal("api/selfcare/profile/{projectId}", &others));
-        assert!(of_other_portal("api/v1/contractor-jobs", &others));
+        assert!(
+            !of_other_portal("api/admin/system/selfcare-menu-configuration", &others),
+            "a word inside a part"
+        );
         assert!(!of_other_portal("api/admin/orders", &others));
         assert!(!of_other_portal("api/selfcareless", &others), "whole segments only");
     }

@@ -24,6 +24,7 @@ pub struct ShotSpec {
     pub page: String,
     /// App path, may hold `:param` / `{param}`.
     pub path: String,
+    #[serde(deserialize_with = "params_as_text")]
     pub params: BTreeMap<String, String>,
     /// Name from [app.users]; default the first.
     pub user: Option<String>,
@@ -48,6 +49,22 @@ pub struct Shot {
     pub unmatched_masks: Vec<String>,
     /// Dialogs the page opened and doctest answered (`alert "Saved" (OK)`).
     pub dialogs: Vec<String>,
+}
+
+/// Route params as text: `{"id": 8}` is read as `{"id": "8"}`.
+fn params_as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    use serde::Deserialize;
+    let raw: BTreeMap<String, serde_json::Value> = BTreeMap::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
+            (k, text)
+        })
+        .collect())
 }
 
 /// Is this request allowed in safe mode? Reads (GET, HEAD, OPTIONS) always are; others only when a pattern in
@@ -379,8 +396,14 @@ fn launch(
     call_timeout: Duration,
 ) -> Result<(Browser, Arc<Tab>), String> {
     let owner = std::ffi::OsStr::new(OWNER_ARG.as_str());
+    // a port the system says is free; the Chrome library's own pick (8000-9000) can be the app's port
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok();
     let opts = LaunchOptions::default_builder()
         .path(Some(chrome.to_path_buf()))
+        .port(port)
         .args(vec![owner])
         .headless(headless)
         .window_size(Some((1440, 900)))
@@ -392,6 +415,27 @@ fn launch(
     let tab = browser.new_tab().map_err(|e| format!("cannot open a tab: {e}"))?;
     tab.set_default_timeout(Duration::from_secs(20));
     Ok((browser, tab))
+}
+
+/// Opens a URL in the tab. Waiting for the load to finish can time out on pages that keep loading (a request that
+/// never ends, a leave-page prompt answered late); then doctest tries once more and, if Chrome took the URL, goes on
+/// and lets `settle` wait for the page.
+fn open(tab: &Tab, url: &str) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..2 {
+        match tab.navigate_to(url) {
+            Err(e) => last = e.to_string(),
+            Ok(t) => match t.wait_until_navigated() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e.to_string(),
+            },
+        }
+        let here = tab.get_url();
+        if here.split(['?', '#']).next() == url.split(['?', '#']).next() && !here.starts_with("about:") {
+            return Ok(());
+        }
+    }
+    Err(format!("cannot open {url}: {last}"))
 }
 
 fn on_login_page(url: &str, login_url: &str) -> bool {
@@ -813,9 +857,7 @@ impl Shooter {
                 }
             },
             Step::Goto { goto } => {
-                tab.navigate_to(&format!("{base}{}", subst(goto)))
-                    .and_then(|t| t.wait_until_navigated())
-                    .map_err(|e| format!("step {i}: cannot open {goto}: {e}"))?;
+                open(tab, &format!("{base}{}", subst(goto))).map_err(|e| format!("step {i}: {e}"))?;
             }
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -865,6 +907,19 @@ impl Shooter {
                 allow: self.cfg.screenshots.allow.clone(),
                 ..Default::default()
             });
+            // one colour scheme for every guide image, whatever the machine or a restarted Chrome prefers
+            let scheme = self.cfg.screenshots.color_scheme.to_lowercase();
+            if scheme == "light" || scheme == "dark" {
+                use headless_chrome::protocol::cdp::Emulation;
+                tab.call_method(Emulation::SetEmulatedMedia {
+                    media: None,
+                    features: Some(vec![Emulation::MediaFeature {
+                        name: "prefers-color-scheme".into(),
+                        value: scheme,
+                    }]),
+                })
+                .map_err(|e| format!("cannot set the colour scheme: {e}"))?;
+            }
             // a dialog (alert, confirm, prompt, "Leave site?") stops the page until it is answered: answer it at once
             // (alerts and "Leave site?" with OK, confirm and prompt with Cancel, so nothing is confirmed) and say so
             let dialog = tab.get_dialog();
@@ -1030,17 +1085,22 @@ impl Shooter {
         let tab = tab.clone();
         let path = path.to_string();
         let base = self.cfg.app.base_url.clone();
-        tab.navigate_to(&format!("{base}{path}"))
-            .and_then(|t| t.wait_until_navigated())
-            .map_err(|e| format!("cannot open {base}{path}: {e}"))?;
+        open(&tab, &format!("{base}{path}"))?;
         let deadline = self.deadline.unwrap_or_else(|| std::time::Instant::now() + SHOT_LIMIT);
         let left = |max: Duration| max.min(deadline.saturating_duration_since(std::time::Instant::now()));
         settle(&tab, left(Duration::from_secs(8)));
         let user = self.current.clone().unwrap_or_default();
         let (login_url, _) = self.cfg.login_for(&user);
+        // the sign-in page of any portal (an app may send a selfcare page to the admin sign-in)
+        let mut logins: Vec<String> = self.cfg.login_targets().into_iter().map(|(_, l)| l).collect();
+        logins.push(login_url.clone());
+        logins.push(self.cfg.app.login_url.clone());
+        logins.retain(|l| !l.is_empty());
+        let shooting_a_login = logins.iter().any(|l| on_login_page(&format!("x://h{path}"), l));
         let guard = self.sessions.get(&user).map(|s| s.guard.clone());
         let signed_out = |tab: &Arc<Tab>| -> Result<(), String> {
-            if !path.starts_with(&login_url) && on_login_page(&tab.get_url(), &login_url) {
+            let url = tab.get_url();
+            if !shooting_a_login && logins.iter().any(|l| on_login_page(&url, l)) {
                 let (refused, blocked) = guard
                     .as_ref()
                     .map(|g| {
@@ -1496,7 +1556,14 @@ pub(crate) mod tests {
             "{:?}",
             shot.dialogs
         );
-        assert_ne!(sh.page_text().map(|_| ()).ok(), None);
+        // every guide image in the same colour scheme (light unless [screenshots] color_scheme says otherwise)
+        let light = sh
+            .current_tab()
+            .unwrap()
+            .evaluate("matchMedia('(prefers-color-scheme: light)').matches", false)
+            .unwrap()
+            .value;
+        assert_eq!(light, Some(serde_json::json!(true)));
         // a section below the fold of a layout's own scroll box
         let mut s = spec("/scrollbox.html");
         s.id = "orders/low-1".into();

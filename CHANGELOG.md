@@ -6,6 +6,21 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- claim: `kinds` narrow the queue instead of widening it (`shot`/`shots` both mean screenshot items); a page's
+  screenshot item waits only for its own guide and translations; an empty answer rebuilds the queue once; an item
+  whose page doctest no longer lists leaves the queue; writing a process guide answers the process suggestion.
+- Screenshots: any portal's sign-in page counts as signed out; shoot_pages refuses identical images for different
+  pages; Chrome gets a free debugging port (never the app's); a fixed colour scheme (`[screenshots] color_scheme`,
+  light by default); a page that does not finish loading is opened again; params may be numbers.
+- Pages: a route whose path an earlier route already uses is not a page; module names that differ only in
+  punctuation share one folder; frames that wrap content are followed further for labels; i18n keys named anywhere in
+  a page's code count as labels; API paths built at run time are read from the contract object that names the page,
+  `${kind}` paths and the functions a page imports (as possible calls).
+- Actions: a POST to a delete path (or with a "deleted" message) is Delete, a GET is never Post, a create call on a
+  page with no Add is Edit; success messages are expected in the guide only when the page shows the API's message.
+- Translations: their own words for the template lead-ins (**What you should see:**) are accepted, and a link to a
+  translation not written yet is a warning. The jobs page gets the queued jobs, commands and schedule from the app.
+
 - Text first, screenshots after: guides are written without screenshots (a `<!-- shot -->` line marks each place);
   `shoot_pages` takes every page's opening screenshot in parallel without the AI and puts it in every language's
   guide; `shots:<page>` items ask for the action screenshots once the writing is done. A guide short of

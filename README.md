@@ -142,6 +142,9 @@ itself, several browsers at once and with no AI involved, and puts it in each la
 handed out once every guide and translation is written. Adding a screenshot to a guide does not make its
 translations stale. `shoot` sends the image back only with `show: true`, and refuses a blank image.
 
+Every shot uses the same colour scheme (`[screenshots] color_scheme = "light"`, or `dark`, or `auto`), a sign-in page
+of any portal counts as "not signed in", and `shoot_pages` refuses a picture that several pages share.
+
 A shot cannot hang: each Chrome call gives up after 60 seconds and a shot after 90, alert, confirm and leave-page
 dialogs are answered (confirm with Cancel) and listed in the reply, and parent routes whose page only holds child
 pages (`<router-view/>`) are not listed as pages.

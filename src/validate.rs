@@ -55,6 +55,9 @@ const TEMPLATE_BOLD: [&str; 8] = [
 static RAW_LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)<(?:a\s[^>]*href|img\s[^>]*src)\s*="#).unwrap());
 static BOLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*\n]+?)\*\*").unwrap());
 static LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(!?)\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)").unwrap());
+/// A bold lead-in at the start of a line: `**What you should see:**` or `**Note**:`.
+static LEAD_IN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^[ \t>*-]*(?:\d+\.\s*)?\*\*([^*\n]+?):?\*\*:?").unwrap());
 static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```.*?```|`[^`\n]*`").unwrap());
 
 /// Lowercase, single spaces, without trailing `:` `.` `*` `…`.
@@ -90,6 +93,24 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                     .map(|k| norm(&crate::pages::headline(k.split('.').next_back().unwrap_or(k)))),
             )
             .collect();
+        // a translation writes the template's lead-ins (**What you should see:**) in its own language: as many
+        // bold lead-ins at the start of a line as its primary guide has template ones are accepted
+        let primary = cfg.primary_language();
+        let mut lead_ins_left = if src.fm.lang != primary {
+            let other = crate::work::swap_lang(&src.path, primary);
+            all.iter()
+                .find(|s| s.path == other)
+                .map(|p| {
+                    LEAD_IN
+                        .captures_iter(&p.body)
+                        .filter(|c| TEMPLATE_BOLD.iter().any(|t| norm(t) == norm(&c[1])))
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let lead_ins: Vec<String> = LEAD_IN.captures_iter(&text).map(|c| norm(&c[1])).collect();
         let mut reported = Vec::new();
         for cap in BOLD.captures_iter(&text) {
             // a menu path is written **A > B**; a label may itself hold ">" or "->"
@@ -102,6 +123,10 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             for part in parts {
                 let n = norm(part);
                 if n.is_empty() || known.contains(&n) || reported.contains(&n) {
+                    continue;
+                }
+                if lead_ins_left > 0 && lead_ins.contains(&n) {
+                    lead_ins_left -= 1;
                     continue;
                 }
                 reported.push(n);
@@ -127,7 +152,7 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             for a in &acts {
                 let words: &[&str] = match a.name.as_str() {
                     "Add" => &["add", "create", "new"],
-                    "Edit" => &["edit", "update", "change"],
+                    "Edit" => &["edit", "update", "change", "save"],
                     "Delete" => &["delete", "remove"],
                     _ => &[],
                 };
@@ -141,8 +166,10 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                         a.name, a.endpoint, a.name
                     )));
                 }
-                // only messages that read as sentences (an untranslated key cannot be quoted)
-                for m in a.success.iter().filter(|m| m.trim().contains(' ')) {
+                // only messages that read as sentences (an untranslated key cannot be quoted), and only on a page
+                // that shows the API's message at all
+                let api_messages = crate::pages::shows_api_messages(cfg, f);
+                for m in a.success.iter().filter(|m| api_messages && m.trim().contains(' ')) {
                     if !src.body.contains(m.as_str()) {
                         out.push(Problem::warning(format!(
                             "the {} action's success message *{m}* is not in the guide",
@@ -195,7 +222,7 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
             }
             if path.ends_with(".md") {
                 if !all.iter().any(|s| s.path == resolved) {
-                    out.push(Problem::error(format!("link to {target} does not match any source")));
+                    out.push(missing_link(target, &resolved, src, cfg, all));
                 }
                 continue;
             }
@@ -225,7 +252,7 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
         } else if path.ends_with(".md") {
             let resolved = normalize(&dir.join(path));
             if !all.iter().any(|s| s.path == resolved) {
-                out.push(Problem::error(format!("link to {target} does not match any source")));
+                out.push(missing_link(target, &resolved, src, cfg, all));
             }
         }
     }
@@ -245,6 +272,39 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
         )));
     }
     out
+}
+
+/// A link to no source. In a translation, a link to a guide whose primary-language page exists is fine (its
+/// translation is written later, maybe by another worker right now); otherwise the answer names where a source of
+/// that file name is.
+fn missing_link(target: &str, resolved: &Path, src: &Source, cfg: &Config, all: &[Source]) -> Problem {
+    let primary = cfg.primary_language();
+    if src.fm.lang != primary {
+        let original = crate::work::swap_lang(resolved, primary);
+        if all.iter().any(|s| s.path == original) {
+            return Problem::warning(format!(
+                "link to {target}: its {} translation is not written yet (the {primary} page exists, so the link works once it is)",
+                src.fm.lang
+            ));
+        }
+    }
+    let name = resolved.file_name();
+    let lang_dir = Path::new("guide").join(&src.fm.lang);
+    let near: Vec<String> = all
+        .iter()
+        .filter(|s| s.path.file_name() == name && s.path.starts_with(&lang_dir))
+        .map(|s| s.path.display().to_string())
+        .take(2)
+        .collect();
+    Problem::error(if near.is_empty() {
+        format!("link to {target} does not match any source")
+    } else {
+        format!(
+            "link to {target} does not match any source (it resolves to {}; a source of that name is {}: link to it relative to this file)",
+            resolved.display(),
+            near.join(" or ")
+        )
+    })
 }
 
 pub fn normalize(p: &Path) -> PathBuf {
@@ -356,6 +416,45 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].level, Level::Error);
         assert!(p[0].message.contains("unknown UI name \"Submit\""), "{}", p[0].message);
+    }
+
+    #[test]
+    fn translations_keep_the_template_lead_ins_and_link_ahead() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = shop_config(d.path());
+        let en = Source::parse(
+            Path::new("guide/en/orders/shop-orders-create.md"),
+            "---\ntitle: New Order\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\n---\nClick **Save**.\n\n**What you should see:** saved.\n\nSee [list](shop-orders-index.md).\n",
+        )
+        .unwrap();
+        let en_list = Source::parse(
+            Path::new("guide/en/orders/shop-orders-index.md"),
+            "---\ntitle: Orders\nkind: page\nmodule: orders\nroutes: [shop.orders.index]\n---\nx\n",
+        )
+        .unwrap();
+        let id = Source::parse(
+            Path::new("guide/id/orders/shop-orders-create.md"),
+            "---\ntitle: Pesanan Baru\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\nlang: id\n---\nKlik **Save**.\n\n**Yang akan Anda lihat:** tersimpan.\n\nLihat [daftar](shop-orders-index.md).\n\n**Rahasia:** x\n",
+        )
+        .unwrap();
+        let all = vec![en, en_list, id.clone()];
+        let p = check_source(&id, Some(&facts()), &cfg, &all);
+        let errors: Vec<&str> = p
+            .iter()
+            .filter(|x| x.level == Level::Error)
+            .map(|x| x.message.as_str())
+            .collect();
+        assert!(!errors.iter().any(|m| m.contains("Yang akan Anda lihat")), "{errors:?}");
+        assert!(
+            errors.iter().any(|m| m.contains("Rahasia")),
+            "only as many lead-ins as the primary has: {errors:?}"
+        );
+        assert!(!errors.iter().any(|m| m.contains("shop-orders-index")), "{errors:?}");
+        assert!(
+            p.iter()
+                .any(|x| x.level == Level::Warning && x.message.contains("not written yet")),
+            "{p:?}"
+        );
     }
 
     #[test]
