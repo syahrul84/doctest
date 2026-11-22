@@ -6,6 +6,16 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- check: `--changed` (guides git sees changed) and route keys or guide paths narrow it; page facts are built once per
+  page and cached between runs; the progress line says about how long is left. A missing action section is an
+  error only for the page's own call whose control is on screen (disabled controls do not count), otherwise a
+  warning; a bold name that is a text of the app but not seen on the page is a warning.
+- write_doc rebuilds only the pages a save touches (the page, its side-menu neighbours, its other languages, the
+  indexes and search), not the whole site.
+- `retake` takes stored screenshots again in parallel (all, by page pattern or ids); a shot whose element appears
+  late is tried twice. `doctest login` succeeds only after the window leaves every sign-in page and the app stored a
+  session. Report pages pick their definition from the kind they pass (`downloadReport('asset-fsr')`).
+
 - Shared screens: a route's props (`kind`) flow down to the components that pass them on; template parts and script
   branches for another kind (`v-if="kind === 'x'"`, `kind === 'x' ? a() : b()`) and what a parent's boolean props
   hide (`<List approval />`, `:new-to="approval ? null : …"`) are left out; components only those parts render are

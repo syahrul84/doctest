@@ -30,26 +30,122 @@ impl CheckReport {
     }
 }
 
+/// Which guides a check looks at: all, the ones git sees changed, or the ones named (route keys or source paths, `*`
+/// allowed). A narrowed check skips the project-wide parts (env keys, unused images, the code scan).
+#[derive(Debug, Default, Clone)]
+pub struct Only {
+    pub changed: bool,
+    pub names: Vec<String>,
+}
+
+impl Only {
+    pub fn all(&self) -> bool {
+        !self.changed && self.names.is_empty()
+    }
+}
+
+/// Guide sources git sees as changed or new under the document folder.
+fn git_changed_sources(cfg: &Config) -> BTreeSet<std::path::PathBuf> {
+    let root = source::source_root(cfg);
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--"])
+        .arg(&root)
+        .current_dir(&cfg.root)
+        .output();
+    let Ok(out) = out else { return BTreeSet::new() };
+    let top = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cfg.root)
+        .output()
+        .ok()
+        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| cfg.root.clone());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.get(3..))
+        .map(|p| p.rsplit(" -> ").next().unwrap_or(p).trim_matches('"'))
+        .filter_map(|p| top.join(p).strip_prefix(&root).ok().map(|r| r.to_path_buf()))
+        .collect()
+}
+
+#[cfg(test)]
 pub fn run(
     cfg: &Config,
     api: &mut dyn CodemapApi,
     state: &mut State,
     progress: &dyn crate::progress::Progress,
 ) -> Result<CheckReport, String> {
+    run_only(cfg, api, state, progress, &Only::default())
+}
+
+pub fn run_only(
+    cfg: &Config,
+    api: &mut dyn CodemapApi,
+    state: &mut State,
+    progress: &dyn crate::progress::Progress,
+    only: &Only,
+) -> Result<CheckReport, String> {
     let mut r = CheckReport::default();
     let sources = source::sources(cfg)?;
     let labels = Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+    let changed = if only.changed {
+        git_changed_sources(cfg)
+    } else {
+        BTreeSet::new()
+    };
+    let wanted = |s: &source::Source| {
+        if only.all() {
+            return true;
+        }
+        let key = s.fm.routes.first().cloned().unwrap_or_default();
+        (only.changed && changed.contains(&s.path))
+            || only.names.iter().any(|n| {
+                let path = s.path.to_string_lossy();
+                crate::work::page_matches(&key, &path, std::slice::from_ref(n))
+                    || path == n.trim_start_matches("_source/")
+            })
+    };
+    let picked: Vec<&source::Source> = sources.iter().filter(|s| wanted(s)).collect();
     {
         let mut fb = FactBuilder::new(api, cfg, &labels);
         let pages = fb.pages()?;
-        for (n, s) in sources.iter().enumerate() {
-            progress.step(n + 1, sources.len(), "checking guides against their pages");
+        // facts once per page (every language's guide uses the same), kept between runs while the page's code is unchanged
+        let mut cache = crate::factcache::FactCache::load(cfg, labels.files_hash());
+        let mut by_page: std::collections::HashMap<String, crate::pages::PageFacts> = std::collections::HashMap::new();
+        let started = std::time::Instant::now();
+        for (n, s) in picked.iter().enumerate() {
+            let left = if n >= 5 {
+                let per = started.elapsed().as_secs_f64() / n as f64;
+                let secs = (per * (picked.len() - n) as f64) as u64;
+                format!(" (about {} left)", crate::work::duration(secs))
+            } else {
+                String::new()
+            };
+            progress.step(
+                n + 1,
+                picked.len(),
+                &format!("checking guides against their pages{left}"),
+            );
             let mut facts = None;
             if s.fm.kind == Kind::Page {
                 let key = s.fm.routes.first().cloned().unwrap_or_default();
                 match pages.iter().find(|p| p.key == key) {
                     Some(page) => {
-                        let f = fb.facts(page)?;
+                        let f = match by_page.get(&key) {
+                            Some(f) => f.clone(),
+                            None => {
+                                let f = match cache.get(cfg, &key) {
+                                    Some(f) => f,
+                                    None => {
+                                        let f = fb.facts(page)?;
+                                        cache.put(cfg, &f);
+                                        f
+                                    }
+                                };
+                                by_page.insert(key.clone(), f.clone());
+                                f
+                            }
+                        };
                         if s.fm.lang == cfg.primary_language() {
                             let fp = fingerprint(&f, labels.files_hash());
                             if state.pages.get(&key).and_then(|p| p.documented_fingerprint.as_deref())
@@ -76,6 +172,16 @@ pub fn run(
                 }
             }
         }
+        cache.save();
+    }
+    if !only.all() {
+        // a narrowed check: only the guides asked for
+        r.warnings.push(format!(
+            "checked {} of {} guide sources (narrowed); run check without a filter for the whole project",
+            picked.len(),
+            sources.len()
+        ));
+        return Ok(r);
     }
     let docs: String = sources
         .iter()

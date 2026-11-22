@@ -738,13 +738,20 @@ impl<'a> FactBuilder<'a> {
         // its kind from the page key: `'department': {...}`) gives the base paths; the page's own files are read
         // whole. Template paths that start with a field of that object (`${c.endpoint}/…`) are joined to its value.
         // These calls are possible, not certain.
-        // the route's own props first (`{kind: "department"}`), then the words of its key
+        // the kind this page is (tried last to first): the last word of its key, the kinds its own code passes to an
+        // API call (`downloadReport('asset-fsr', …)`), and its route's props (`{kind: "department"}`). Earlier key
+        // words (`asset` in admin.asset.report.x) name the module, not the kind.
         let mut hints: Vec<String> = page
             .key
             .split(['.', '/'])
-            .filter(|w| !w.is_empty() && !GENERIC_KEY_WORDS.contains(w))
-            .map(String::from)
-            .collect();
+            .rfind(|w| !w.is_empty() && !GENERIC_KEY_WORDS.contains(w))
+            .map(|w| vec![w.to_string()])
+            .unwrap_or_default();
+        for k in call_kinds(&own_code) {
+            if !hints.contains(&k) {
+                hints.push(k);
+            }
+        }
         for v in page.props.values() {
             if !v.is_empty() && !v.contains(' ') && !hints.contains(v) {
                 hints.push(v.clone());
@@ -1141,6 +1148,9 @@ pub struct Action {
     /// Messages that read as success.
     pub success: Vec<String>,
     pub errors: Vec<String>,
+    /// Reached only through shared code, or a guess: a guide needs it only if the page shows its control.
+    #[serde(default)]
+    pub possible: bool,
 }
 
 const NAMED_ACTIONS: [&str; 22] = [
@@ -1476,7 +1486,21 @@ pub fn prune_template(vue: &str, flags: &BTreeMap<String, bool>, strings: &BTree
         Regex::new(r#"<([a-zA-Z][\w.-]*)\b[^>]*\bv-(if|else-if)\s*=\s*"\s*(!?)\s*(?:props\.)?(\w+)\s*""#).unwrap()
     });
     static ELSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<([a-zA-Z][\w.-]*)\b[^>]*\bv-else\b").unwrap());
+    static DISABLED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<([a-zA-Z][\w.-]*)\b[^>]*?(?:\sdisabled(?:\s|/|>|="(?:true|disabled)?")|\s:disabled="true")"#)
+            .unwrap()
+    });
     let mut text = vue.to_string();
+    // a control that is always disabled is not one a reader can use
+    for _ in 0..200 {
+        let Some(c) = DISABLED.captures(&text) else { break };
+        let start = c.get(0).map(|m| m.start()).unwrap_or(0);
+        let end = element_end(&text, start, &c[1]);
+        if end <= start {
+            break;
+        }
+        text.replace_range(start..end, "");
+    }
     // repeat: removing one element shifts the rest
     for _ in 0..200 {
         let mut edit: Option<(usize, usize, String)> = None;
@@ -1784,6 +1808,16 @@ pub fn mentions_call(code: &str, name: &str) -> bool {
 /// A URL that starts with a run-time value: `` `${base}/x` `` or `base + '/x'` as a call's first argument.
 static DYNAMIC_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?:\(|,)\s*(?:`\$\{|[A-Za-z_][\w.\]\[']*\s*\+\s*['"`])"#).unwrap());
+
+/// Kinds a page's code passes as a call's first argument: `api.downloadReport('asset-fsr', …)` → asset-fsr.
+pub fn call_kinds(code: &str) -> Vec<String> {
+    static K: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\b\w+\.\w+\(\s*['"]([a-z][a-z0-9]*(?:-[a-z0-9]+)*)['"]"#).unwrap());
+    let mut out: Vec<String> = K.captures_iter(code).map(|c| c[1].to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
 
 /// Words of a page key that say what kind of screen it is, not what it shows.
 const GENERIC_KEY_WORDS: [&str; 14] = [
@@ -2235,6 +2269,19 @@ fn button_words(action: &str) -> &'static [&'static str] {
     }
 }
 
+/// The actions a guide must cover (and show in screenshots): the page's own calls whose control is on screen.
+pub fn required_actions(f: &PageFacts) -> Vec<Action> {
+    actions(f)
+        .into_iter()
+        .filter(|a| !a.possible && shows_button(f, &a.name))
+        .collect()
+}
+
+/// Does the page show a control for this action (its words on screen)?
+pub fn shows_control(f: &PageFacts, action: &str) -> bool {
+    shows_button(f, action)
+}
+
 fn shows_button(f: &PageFacts, action: &str) -> bool {
     let words = button_words(action);
     let texts: Box<dyn Iterator<Item = &String>> = if f.screen_texts.is_empty() {
@@ -2262,6 +2309,7 @@ fn action_of(e: &Endpoint, name: String) -> Action {
             .collect(),
         success,
         errors,
+        possible: e.possible,
     }
 }
 
@@ -2851,7 +2899,7 @@ fn walk_menu(node: &Node, module: &str, group: &str, out: &mut Vec<MenuEntry>) {
 /// Prefix of the current fingerprint format; fingerprints without it were made by an older doctest. Bump it whenever
 /// doctest reads pages differently (new kinds of screen text, better endpoint attribution), so guides that were up
 /// to date carry over instead of all turning stale.
-pub const FINGERPRINT_VERSION: &str = "v5:";
+pub const FINGERPRINT_VERSION: &str = "v6:";
 
 /// What a page's guide depends on: what the user sees (path, labels, literal texts, menu path) and what its actions
 /// do (endpoints with their rules, permissions and messages). doctest's own bookkeeping (code files, components,

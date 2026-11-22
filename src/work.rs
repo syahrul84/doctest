@@ -190,7 +190,11 @@ pub fn shots_short(cfg: &Config, sources: &[Source], key: &str, f: &crate::pages
         .filter_map(|lang| {
             let g = page_guide(sources, key, lang)?;
             let need = cfg.guide.min_screenshots.unwrap_or_else(|| {
-                crate::pages::screenshot_plan_for(&crate::pages::actions(f), crate::pages::says_no_data(&g.body)).len()
+                crate::pages::screenshot_plan_for(
+                    &crate::pages::required_actions(f),
+                    crate::pages::says_no_data(&g.body),
+                )
+                .len()
             });
             let have = guide_images(&g.body);
             (have < need).then(|| format!("{lang} {have}/{need}"))

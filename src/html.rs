@@ -296,6 +296,18 @@ fn write(cfg: &Config, rel: &Path, text: &str, report: &mut BuildReport) -> Resu
 }
 
 pub fn build(cfg: &Config, sources: &[Source], state: &State) -> Result<BuildReport, String> {
+    build_some(cfg, sources, state, None)
+}
+
+/// Builds the HTML; with `changed`, only the pages those sources touch: themselves, the guides whose side menu lists
+/// them (same language, portal and module), their other-language versions (language links), and the indexes and
+/// search files. A full build also removes HTML whose source is gone.
+pub fn build_some(
+    cfg: &Config,
+    sources: &[Source],
+    state: &State,
+    changed: Option<&[PathBuf]>,
+) -> Result<BuildReport, String> {
     // parallel workers: one build at a time, and from the sources on disk now (another worker may have added one)
     let _lock = crate::state::FileLock::acquire(cfg.out.join(".doctest/build.lock"))?;
     let fresh;
@@ -359,8 +371,44 @@ pub fn build(cfg: &Config, sources: &[Source], state: &State) -> Result<BuildRep
         v
     };
 
+    // what a partial build re-renders
+    let touched = |s: &Source| -> bool {
+        let Some(changed) = changed else { return true };
+        changed.iter().any(|c| {
+            if s.path == *c {
+                return true;
+            }
+            let Some(src) = sources.iter().find(|x| x.path == *c) else {
+                return false;
+            };
+            if !(s.path.starts_with("guide") && c.starts_with("guide")) {
+                return false;
+            }
+            let same_menu = s.fm.lang == src.fm.lang
+                && portal_of_path(cfg, &s.path) == portal_of_path(cfg, c)
+                && s.fm.module == src.fm.module;
+            let other_lang = crate::work::swap_lang(&s.path, &src.fm.lang) == *c;
+            same_menu || other_lang
+        })
+    };
     for s in sources {
         let rel = out_path(&s.path);
+        if !touched(s) {
+            // not re-rendered; still in the search index
+            if s.path.starts_with("guide") {
+                let url = rel
+                    .strip_prefix("guide")
+                    .unwrap_or(&rel)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                guide_search.push(json!({"title": s.fm.title, "url": url, "lang": s.fm.lang, "text": plain(&s.body)}));
+            } else {
+                search.push(
+                    json!({"title": s.fm.title, "url": rel.to_string_lossy(), "lang": "", "text": plain(&s.body)}),
+                );
+            }
+            continue;
+        }
         let content = render_markdown(&s.body, &rel);
         let (lang, langs_html, nav_extra) = if s.path.starts_with("guide") {
             let lang = s.fm.lang.as_str();
@@ -574,7 +622,9 @@ pub fn build(cfg: &Config, sources: &[Source], state: &State) -> Result<BuildRep
         &mut report,
     )?;
 
-    remove_orphans(cfg, &cfg.out, &mut report);
+    if changed.is_none() {
+        remove_orphans(cfg, &cfg.out, &mut report);
+    }
     Ok(report)
 }
 
@@ -668,6 +718,34 @@ mod tests {
         let gi = read(&cfg, "guide/en/index.html");
         assert!(gi.contains(r#"href="orders/shop-orders-create.html""#) && gi.contains("Create an order."));
         assert!(gi.find("New Order").unwrap() < gi.find("Order List").unwrap());
+    }
+
+    #[test]
+    fn a_save_rebuilds_only_the_pages_it_touches() {
+        let (_d, cfg, full) = built();
+        let changed = [PathBuf::from("guide/en/orders/shop-orders-index.md")];
+        let r = build_some(&cfg, &sample(), &State::default(), Some(&changed)).unwrap();
+        let written: Vec<String> = r.written.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        // the page, its module neighbour (side menu) and the other language's version (language links)
+        for want in [
+            "guide/en/orders/shop-orders-index.html",
+            "guide/en/orders/shop-orders-create.html",
+            "guide/assets/search.js",
+        ] {
+            assert!(written.iter().any(|w| w == want), "{want} not in {written:?}");
+        }
+        assert!(
+            !written
+                .iter()
+                .any(|w| w == "index.html" || w.starts_with("system/configuration")),
+            "{written:?}"
+        );
+        assert!(r.written.len() < full.written.len());
+        // the search index still has every guide
+        assert!(
+            read(&cfg, "guide/assets/search.js").contains("Simpan")
+                || read(&cfg, "guide/assets/search.js").contains("shop-orders-create")
+        );
     }
 
     #[test]

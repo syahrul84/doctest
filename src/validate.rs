@@ -60,6 +60,26 @@ static LEAD_IN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^[ \t>*-]*(?:\d+\.\s*)?\*\*([^*\n]+?):?\*\*:?").unwrap());
 static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```.*?```|`[^`\n]*`").unwrap());
 
+/// Every UI text of the app in a language (its locale files), normalized; loaded once per project and language.
+fn app_texts(cfg: &Config, lang: &str) -> std::sync::Arc<std::collections::HashSet<String>> {
+    type Texts =
+        std::collections::HashMap<(std::path::PathBuf, String), std::sync::Arc<std::collections::HashSet<String>>>;
+    static CACHE: LazyLock<std::sync::Mutex<Texts>> = LazyLock::new(|| std::sync::Mutex::new(Texts::new()));
+    let key = (cfg.root.clone(), lang.to_string());
+    if let Some(t) = CACHE.lock().expect("texts").get(&key) {
+        return t.clone();
+    }
+    let labels = crate::i18n::Labels::load(&cfg.frontends, &cfg.backend, &cfg.languages);
+    let set: std::collections::HashSet<String> = labels
+        .by_lang
+        .get(lang)
+        .map(|m| m.values().map(|v| norm(v)).collect())
+        .unwrap_or_default();
+    let set = std::sync::Arc::new(set);
+    CACHE.lock().expect("texts").insert(key, set.clone());
+    set
+}
+
 /// Lowercase, single spaces, without trailing `:` `.` `*` `…`.
 pub fn norm(s: &str) -> String {
     s.split_whitespace()
@@ -129,12 +149,21 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                     lead_ins_left -= 1;
                     continue;
                 }
-                reported.push(n);
-                out.push(Problem::error(format!(
-                    "unknown UI name \"{}\" on {}; use the on-screen text or add it to [guide] allow_bold",
-                    part.trim().trim_end_matches(':'),
-                    f.page.key
-                )));
+                reported.push(n.clone());
+                let name = part.trim().trim_end_matches(':');
+                if app_texts(cfg, &src.fm.lang).contains(&n) {
+                    // a text of the app, just not one doctest saw this page use (a toolbar of a layout or a sibling
+                    // page, a label from option data)
+                    out.push(Problem::warning(format!(
+                        "\"{name}\" is a text of the app but doctest did not see {} use it: check it is on this page",
+                        f.page.key
+                    )));
+                } else {
+                    out.push(Problem::error(format!(
+                        "unknown UI name \"{name}\" on {}; use the on-screen text or add it to [guide] allow_bold",
+                        f.page.key
+                    )));
+                }
             }
         }
     }
@@ -161,10 +190,18 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
                     .iter()
                     .any(|h| h.contains(&name) || words.iter().any(|w| h.contains(w)));
                 if !found {
-                    out.push(Problem::error(format!(
+                    let msg = format!(
                         "no section for the {} action ({}): add a heading such as \"## {} …\" with the steps and what the user should see after it",
                         a.name, a.endpoint, a.name
-                    )));
+                    );
+                    // required only when the page's own code calls it and its control is on screen
+                    if !a.possible && crate::pages::shows_control(f, &a.name) {
+                        out.push(Problem::error(msg));
+                    } else {
+                        out.push(Problem::warning(format!(
+                            "{msg} — only if the page shows it: its control was not found on this page"
+                        )));
+                    }
                 }
                 // only messages that read as sentences (an untranslated key cannot be quoted), and only on a page
                 // that shows the API's message at all
@@ -183,7 +220,7 @@ pub fn check_source(src: &Source, facts: Option<&PageFacts>, cfg: &Config, all: 
         let min = cfg
             .guide
             .min_screenshots
-            .unwrap_or_else(|| crate::pages::screenshot_plan_for(&acts, no_data).len());
+            .unwrap_or_else(|| crate::pages::screenshot_plan_for(&crate::pages::required_actions(f), no_data).len());
         let images = LINK.captures_iter(&text).filter(|c| &c[1] == "!").count();
         if images < min {
             // text first: screenshots come after (shoot_pages takes the page shot, a shots:<page> item the rest)
@@ -421,6 +458,15 @@ mod tests {
     }
 
     #[test]
+    fn an_app_text_this_page_was_not_seen_using_is_a_warning() {
+        // "Pesanan" is in the app's id locale but not among this page's labels (a sibling page's toolbar, say)
+        let p = run(&page("id", "Klik **Pesanan**."));
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(p[0].level, Level::Warning);
+        assert!(p[0].message.contains("is a text of the app"), "{}", p[0].message);
+    }
+
+    #[test]
     fn translations_keep_the_template_lead_ins_and_link_ahead() {
         let d = tempfile::tempdir().unwrap();
         let cfg = shop_config(d.path());
@@ -509,7 +555,14 @@ mod tests {
                 uri: "api/orders/{order}".into(),
                 ..Default::default()
             },
+            // no Approve control on this page: a missing section is only a warning
+            crate::pages::Endpoint {
+                method: "POST".into(),
+                uri: "api/orders/{order}/approve".into(),
+                ..Default::default()
+            },
         ];
+        f.literals.push("Delete order".into());
         f
     }
 
@@ -544,6 +597,15 @@ mod tests {
             "{msgs:?}"
         );
         assert!(
+            !msgs.iter().any(|m| m.contains("Approve")),
+            "no Approve control on the page: {msgs:?}"
+        );
+        assert!(
+            p.iter()
+                .any(|x| x.level == Level::Warning && x.message.contains("no section for the Approve action")),
+            "{p:?}"
+        );
+        assert!(
             p.iter()
                 .any(|x| x.level == Level::Warning && x.message.contains("0 of 3 screenshots")),
             "{p:?}"
@@ -559,7 +621,12 @@ mod tests {
     fn complete_page_guide_passes() {
         let body = "Open **Orders**.\n\n![list](guide/img/en/orders/shop-orders-create-1.png)\n\n## Add an order\n1. Click **Save**.\n\nYou see *Order saved.*\n\n![form](guide/img/en/orders/shop-orders-create-2.png)\n\n## Delete an order\nConfirm.\n\n![confirm](guide/img/en/orders/shop-orders-create-3.png)\n";
         let p = strict_run(body);
-        assert!(p.is_empty(), "{p:?}");
+        // only the hint about the Approve action, whose control is not on this page
+        assert!(
+            p.iter()
+                .all(|x| x.level == Level::Warning && x.message.contains("Approve")),
+            "{p:?}"
+        );
     }
 
     #[test]

@@ -467,10 +467,28 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
     tab.navigate_to(&start)
         .and_then(|t| t.wait_until_navigated())
         .map_err(|e| format!("cannot open {start}: {e}"))?;
+    // what the browser keeps for this site before anyone signs in: a sign-in adds a token or a cookie
+    const STORED: &str = "(function(){try{return JSON.stringify([Object.keys(localStorage).sort().join('|'), Object.keys(sessionStorage).sort().join('|'), document.cookie.split(';').map(function(c){return c.split('=')[0].trim()}).sort().join('|')])}catch(e){return ''}})()";
+    let stored = |tab: &Tab| -> String {
+        tab.evaluate(STORED, false)
+            .ok()
+            .and_then(|v| v.value)
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default()
+    };
+    settle(&tab, Duration::from_secs(5));
+    let before = stored(&tab);
+    // the sign-in page of any portal (an app may send one portal's sign-in to another's)
+    let mut logins: Vec<String> = cfg.login_targets().into_iter().map(|(_, l)| l).collect();
+    logins.push(login_url.clone());
+    logins.push(cfg.app.login_url.clone());
+    logins.retain(|l| !l.is_empty());
+    let on_any_login = |url: &str| logins.iter().any(|l| on_login_page(url, l));
     driver(&tab);
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let mut away = 0;
     let mut last = start.clone();
+    let mut signed = false;
     loop {
         std::thread::sleep(Duration::from_millis(700));
         let url = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tab.get_url())) {
@@ -480,18 +498,31 @@ pub fn login(cfg: &Config, user: &str, headless: bool, driver: &dyn Fn(&Tab)) ->
         if !url.starts_with("about:") {
             last = url.clone();
         }
-        away = if on_login_page(&url, &login_url) || url.starts_with("about:") {
+        away = if on_any_login(&url) || url.starts_with("about:") {
             0
         } else {
             away + 1
         };
-        if away >= 3 || std::time::Instant::now() > deadline {
+        if away >= 3 {
+            // left the sign-in page: signed in only if the app stored something for the session
+            let now = stored(&tab);
+            if !now.is_empty() && now != before {
+                signed = true;
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
             break;
         }
     }
-    if on_login_page(&last, &login_url) || last.starts_with("about:") {
+    if !signed {
         return Err(format!(
-            "not signed in: the window closed or 10 minutes passed on {start}"
+            "not signed in: the window closed, 10 minutes passed, or the app stored no session on {start} (last page {last}) — run `doctest login{}` again and sign in in the window",
+            if user == "default" {
+                String::new()
+            } else {
+                format!(" --user {user}")
+            }
         ));
     }
     // let the app finish storing its token, then close Chrome cleanly so the session is written to disk
@@ -1109,6 +1140,17 @@ impl Shooter {
                     self.sessions.remove(&user);
                 }
                 r
+            }
+            // an element that renders a moment late (a menu search box, a row): one more try in the same browser
+            Err(e) if e.contains("not found on") || e.contains("did not appear") => {
+                std::thread::sleep(Duration::from_secs(2));
+                self.capture_once(spec).map_err(|e2| {
+                    if e2 == e {
+                        e2
+                    } else {
+                        format!("{e2} (tried twice; first: {e})")
+                    }
+                })
             }
             Err(e) if dropped(&e) => {
                 let user = spec.user.clone().unwrap_or_else(|| default_user(&self.cfg));

@@ -65,6 +65,11 @@ enum Command {
     Check {
         #[arg(long, default_value = ".")]
         project: PathBuf,
+        /// Check only the guides git sees as changed or new
+        #[arg(long)]
+        changed: bool,
+        /// Check only these guides: route keys or source paths (`admin.orders.*`, `guide/en/orders/x.md`)
+        only: Vec<String>,
     },
     /// Rebuild all HTML under the document folder from its sources
     Build {
@@ -220,11 +225,11 @@ fn status_cmd(project: &std::path::Path, scope: &str, base: Option<&str>, limit:
     Ok(out)
 }
 
-fn check_cmd(project: &std::path::Path) -> Result<(String, bool), String> {
+fn check_cmd(project: &std::path::Path, only: check::Only) -> Result<(String, bool), String> {
     let cfg = load(project)?;
     let mut st = state::State::load(&cfg);
     let mut api = codemap::LiveCodemap::new(&cfg);
-    let r = check::run(&cfg, &mut api, &mut st, &progress::Stderr::default())?;
+    let r = check::run_only(&cfg, &mut api, &mut st, &progress::Stderr::default(), &only)?;
     let mut out = String::new();
     let section = |out: &mut String, title: &str, items: &[String]| {
         if !items.is_empty() {
@@ -303,7 +308,7 @@ fn main() -> ExitCode {
             base,
             limit,
         } => status_cmd(&project, &scope, base.as_deref(), limit).map(|t| (t, true)),
-        Command::Check { project } => check_cmd(&project),
+        Command::Check { project, changed, only } => check_cmd(&project, check::Only { changed, names: only }),
         Command::Build { project } => build_cmd(&project).map(|t| (t, true)),
         Command::Shrink { project } => load(&project).and_then(|cfg| {
             let shots::Shrunk {

@@ -116,6 +116,12 @@ pub fn tools() -> Value {
             &[]
         ),
         tool(
+            "retake",
+            "Take stored screenshots again, several browsers at once, after a [screenshots] change (mask, colour scheme, width) or app change: all: true, pages: [route patterns], or ids: [...]. A shot whose element appears late is tried twice. Long: reports progress.",
+            json!({"all": {"type": "boolean"}, "pages": {"type": "array", "items": {"type": "string"}}, "ids": {"type": "array", "items": {"type": "string"}}, "workers": {"type": "integer"}}),
+            &[]
+        ),
+        tool(
             "shoot",
             SHOOT_HELP,
             json!({"spec": {"type": "object", "description": "id, page, path, params, user, lang, steps, crop, mask, allow_saves (the fields may also be sent at the top level)"}, "id": {"type": "string", "description": "alone: retake the stored spec of this id"}, "retake_page": {"type": "string", "description": "with lang: retake every stored screenshot of this page in that language ([screenshots] per_language)"}, "lang": {"type": "string"}, "show": {"type": "boolean", "description": "send the image back to look at it (off by default: the reply already says when a shot is blank, on the sign-in page, blocked a save or masked nothing)"}}),
@@ -142,8 +148,8 @@ pub fn tools() -> Value {
         tool("build", "Rebuild all HTML under the document folder.", json!({}), &[]),
         tool(
             "check",
-            "Check guides against pages, links, images, env keys, failing doctest tests; lists known-bug tests and code points.",
-            json!({}),
+            "Check guides against pages, links, images, env keys, failing doctest tests; lists known-bug tests and code points. Narrow it with changed: true (guides git sees changed) or only: [route keys or guide paths, * allowed]; a narrowed check skips the project-wide parts.",
+            json!({"changed": {"type": "boolean"}, "only": {"type": "array", "items": {"type": "string"}}}),
             &[]
         ),
         tool(
@@ -484,6 +490,7 @@ impl Server {
             )?),
             "shoot" => shoot(p, args),
             "shoot_pages" => text(shoot_pages(p, args, progress)?),
+            "retake" => text(retake(p, args, progress)?),
             "cases" => text(cases_text(p, s(args, "target").ok_or("target is required")?)?),
             "write_test" => text(write_test(p, args)?),
             "run_tests" => text(run_tests(p, s(args, "filter"))?),
@@ -494,7 +501,11 @@ impl Server {
             }
             "check" => {
                 let mut st = State::load(&p.cfg);
-                let r = crate::check::run(&p.cfg, &mut *p.api, &mut st, progress)?;
+                let only = crate::check::Only {
+                    changed: args.get("changed").and_then(Value::as_bool).unwrap_or(false),
+                    names: strings("only"),
+                };
+                let r = crate::check::run_only(&p.cfg, &mut *p.api, &mut st, progress, &only)?;
                 let points: Vec<String> = r.points.iter().map(crate::issues::Issue::point).collect();
                 text(pretty(
                     &json!({"passed": r.passed(), "errors": r.errors, "warnings": r.warnings, "known_bugs": r.bugs, "code_to_fix": points}),
@@ -1438,10 +1449,10 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 "actions": crate::pages::actions(&f),
                 "possible_actions": crate::pages::possible_actions(&f),
                 "possible_actions_note": "reached only through shared code (a shared screen, a layout or an API module) and no matching button was found on the page: document one only if you see it on the screen; they are not required",
-                "screenshot_plan": crate::pages::screenshot_plan(&crate::pages::actions(&f)),
-                "optional_screenshots": crate::pages::optional_shots(&crate::pages::actions(&f)),
-                "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&crate::pages::actions(&f), true),
-                "min_screenshots": cfg.guide.min_screenshots.unwrap_or(crate::pages::screenshot_plan(&crate::pages::actions(&f)).len()),
+                "screenshot_plan": crate::pages::screenshot_plan(&crate::pages::required_actions(&f)),
+                "optional_screenshots": crate::pages::optional_shots(&crate::pages::required_actions(&f)),
+                "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&crate::pages::required_actions(&f), true),
+                "min_screenshots": cfg.guide.min_screenshots.unwrap_or(crate::pages::screenshot_plan(&crate::pages::required_actions(&f)).len()),
                 "screenshots_note": "Text first: write the guide now WITHOUT screenshots, leaving a line <!-- shot: what it shows --> where each screenshot in screenshot_plan belongs (the skeleton has them). Do not call shoot for this item. Later shoot_pages takes every page's opening shot itself and puts it at <!-- shot: the page as it opens -->, and a shots:<page> item asks for the action shots. If the page has no records to show, put <!-- no-data: why --> in the guide: then only screenshot_plan_without_data is needed.",
                 "screenshots": shots,
                 "image_ref_format": format!("guide/img/{lang}/{}/{}-<n>.webp", source::slug(&page.module), source::slug(&page.key)),
@@ -1563,8 +1574,8 @@ fn facts(p: &mut Project, item: &str) -> Result<String, String> {
                 "item": item,
                 "page": {"key": f.page.key, "path": f.page.path, "portal": f.page.portal, "module": f.page.module},
                 "missing": work::shots_short(&cfg, &sources, key, &f),
-                "screenshot_plan": crate::pages::screenshot_plan(&acts),
-                "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&acts, true),
+                "screenshot_plan": crate::pages::screenshot_plan(&crate::pages::required_actions(&f)),
+                "screenshot_plan_without_data": crate::pages::screenshot_plan_for(&crate::pages::required_actions(&f), true),
                 "actions": acts,
                 "labels": f.labels.get(&primary),
                 "screenshots_taken": shots,
@@ -1746,7 +1757,14 @@ fn write_doc(p: &mut Project, item: &str, markdown: &str) -> Result<String, Stri
         }
         st.clone()
     })?;
-    let r = crate::html::build(&cfg, &source::sources(&cfg)?, &st)?;
+    // only the pages this save touches (a moved guide leaves an old page behind: then all of it)
+    let only = [rel.clone()];
+    let r = crate::html::build_some(
+        &cfg,
+        &source::sources(&cfg)?,
+        &st,
+        if moved.is_empty() { Some(&only[..]) } else { None },
+    )?;
     let warnings: Vec<&str> = problems
         .iter()
         .filter(|x| x.level == crate::validate::Level::Warning)
@@ -1893,42 +1911,10 @@ fn shoot_pages(p: &mut Project, args: &Value, progress: &dyn crate::progress::Pr
         .filter(|(_, _, have)| !have)
         .map(|(pg, s, _)| (pg.key.clone(), s.clone()))
         .collect();
-    let queue = std::sync::Mutex::new(to_shoot);
-    let results: std::sync::Mutex<Vec<(String, Result<crate::shots::Shot, String>)>> =
-        std::sync::Mutex::new(Vec::new());
-    let done = std::sync::atomic::AtomicUsize::new(total - queue.lock().expect("queue").len());
+    let already = total - to_shoot.len();
     let workers = cfg.workers.clamp(1, 8);
-    std::thread::scope(|sc| {
-        for _ in 0..workers {
-            sc.spawn(|| {
-                let mut shooter = match Shooter::start(&eff) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let mut q = queue.lock().expect("queue");
-                        let mut r = results.lock().expect("results");
-                        for (key, _) in q.drain(..) {
-                            r.push((key, Err(e.clone())));
-                        }
-                        return;
-                    }
-                };
-                loop {
-                    let Some((key, spec)) = queue.lock().expect("queue").pop() else {
-                        break;
-                    };
-                    let r = shooter.capture(&spec);
-                    let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    progress.step(
-                        n,
-                        total,
-                        &format!("{} ({})", key, if r.is_ok() { "ok" } else { "failed" }),
-                    );
-                    results.lock().expect("results").push((key, r));
-                }
-            });
-        }
-    });
-    let results = results.into_inner().expect("results");
+    let results = shoot_many(&eff, to_shoot, workers, already, total, progress);
+
     let mut failed: BTreeMap<String, String> = results
         .iter()
         .filter_map(|(k, r)| r.as_ref().err().map(|e| (k.clone(), e.clone())))
@@ -2024,6 +2010,107 @@ fn shoot_pages(p: &mut Project, args: &Value, progress: &dyn crate::progress::Pr
             need_params.len(),
             need_params.iter().take(20).cloned().collect::<Vec<_>>().join(", ")
         );
+    }
+    Ok(out)
+}
+
+/// Takes these specs with `workers` browsers at once; (key, result) for each. Progress counts from `already` of
+/// `total`.
+fn shoot_many(
+    eff: &Config,
+    specs: Vec<(String, ShotSpec)>,
+    workers: usize,
+    already: usize,
+    total: usize,
+    progress: &dyn crate::progress::Progress,
+) -> Vec<(String, Result<crate::shots::Shot, String>)> {
+    let queue = std::sync::Mutex::new(specs);
+    let results: std::sync::Mutex<Vec<(String, Result<crate::shots::Shot, String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let done = std::sync::atomic::AtomicUsize::new(already);
+    std::thread::scope(|sc| {
+        for _ in 0..workers.max(1) {
+            sc.spawn(|| {
+                let mut shooter = match Shooter::start(eff) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut q = queue.lock().expect("queue");
+                        let mut r = results.lock().expect("results");
+                        for (key, _) in q.drain(..) {
+                            r.push((key, Err(e.clone())));
+                        }
+                        return;
+                    }
+                };
+                loop {
+                    let Some((key, spec)) = queue.lock().expect("queue").pop() else {
+                        break;
+                    };
+                    let r = shooter.capture(&spec);
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    progress.step(
+                        n,
+                        total,
+                        &format!("{} ({})", key, if r.is_ok() { "ok" } else { "failed" }),
+                    );
+                    results.lock().expect("results").push((key, r));
+                }
+            });
+        }
+    });
+    results.into_inner().expect("results")
+}
+
+/// `retake`: stored screenshots taken again, several browsers at once (after a [screenshots] change: a new mask,
+/// colour scheme or width): all, those of pages matching a pattern, or the ids given.
+fn retake(p: &mut Project, args: &Value, progress: &dyn crate::progress::Progress) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let eff = effective_cfg(p)?;
+    let st = State::load(&p.cfg);
+    let strings = |k: &str| -> Vec<String> {
+        args.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let ids = strings("ids");
+    let pages = strings("pages");
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    if ids.is_empty() && pages.is_empty() && !all {
+        return Err("say which: ids: [...], pages: [route patterns], or all: true".into());
+    }
+    let specs: Vec<(String, ShotSpec)> = st
+        .shots
+        .values()
+        .filter(|s| all || ids.contains(&s.id) || crate::work::page_matches(&s.page, &s.path, &pages))
+        .map(|s| {
+            let mut s = s.clone();
+            s.user = shot_user(&eff, &s);
+            (s.id.clone(), s)
+        })
+        .collect();
+    let total = specs.len();
+    let workers = args
+        .get("workers")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(p.cfg.workers)
+        .clamp(1, 8);
+    let results = shoot_many(&eff, specs, workers, 0, total, progress);
+    let failed: Vec<String> = results
+        .iter()
+        .filter_map(|(k, r)| r.as_ref().err().map(|e| format!("{k}: {e}")))
+        .collect();
+    let mut out = format!(
+        "retook {} of {total} screenshot(s) with {workers} browser(s) in {}",
+        total - failed.len(),
+        took(started.elapsed())
+    );
+    if !failed.is_empty() {
+        out += &format!("\nfailed ({}):", failed.len());
+        for f in failed.iter().take(40) {
+            out += &format!("\n- {f}");
+        }
     }
     Ok(out)
 }
@@ -2625,6 +2712,7 @@ mod tests {
                 "facts",
                 "write_doc",
                 "shoot_pages",
+                "retake",
                 "shoot",
                 "cases",
                 "write_test",

@@ -149,6 +149,9 @@ The list is cached until a route file changes; `[app] live_routes = false` turns
 Every shot uses the same colour scheme (`[screenshots] color_scheme = "light"`, or `dark`, or `auto`), a sign-in page
 of any portal counts as "not signed in", and `shoot_pages` refuses a picture that several pages share.
 
+`doctest check --changed` (or `check admin.orders.* guide/en/x.md`) checks only some guides; a full check reuses the
+page facts cached by status. `retake` (MCP) takes stored screenshots again in parallel after a [screenshots] change.
+
 A shot cannot hang: each Chrome call gives up after 60 seconds and a shot after 90, alert, confirm and leave-page
 dialogs are answered (confirm with Cancel) and listed in the reply, and parent routes whose page only holds child
 pages (`<router-view/>`) are not listed as pages.
