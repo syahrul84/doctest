@@ -49,9 +49,37 @@ pub fn target_file(cfg: &Config, _target: &str, action: &str) -> (PathBuf, Strin
     };
     if feature {
         let mut found = Vec::new();
-        find_named(&cfg.backend.join(dir), &format!("{test_class}.php"), &mut found);
+        let base = cfg.backend.join(dir);
+        find_named(&base, &format!("{test_class}.php"), &mut found);
         found.sort();
-        if let Some(f) = found.into_iter().next() {
+        // the controller's folders under Controllers (Admin\Asset), to tell same-named controllers apart
+        let want: Vec<String> = class_fqn
+            .split('\\')
+            .skip_while(|p| *p != "Controllers")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .split_last()
+            .map(|(_, dirs)| dirs.iter().map(|d| d.to_lowercase()).collect())
+            .unwrap_or_default();
+        let dirs_of = |f: &Path| -> Vec<String> {
+            f.parent()
+                .and_then(|d| d.strip_prefix(&base).ok())
+                .map(|d| {
+                    d.components()
+                        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                        .filter(|c| c != "http" && c != "controllers")
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let exact = found.iter().find(|f| dirs_of(f) == want).cloned();
+        // a test found elsewhere is only this controller's when no other controller has the same short name
+        let pick = exact.or_else(|| {
+            let mut same = Vec::new();
+            find_named(&cfg.backend.join("app"), &format!("{short}.php"), &mut same);
+            if same.len() > 1 { None } else { found.first().cloned() }
+        });
+        if let Some(f) = pick {
             let ns = std::fs::read_to_string(&f)
                 .ok()
                 .and_then(|t| NAMESPACE.captures(&t).map(|c| c[1].to_string()))
@@ -317,7 +345,159 @@ pub fn file_lock(file: &Path) -> Result<crate::state::FileLock, String> {
         _ => file.to_path_buf(),
     };
     let key = crate::hash::sha256(&resolved.to_string_lossy());
-    crate::state::FileLock::acquire(std::env::temp_dir().join(format!("doctest-{}.lock", &key[..16])))
+    // held while the write waits for the test runner and runs: other workers' runs can take far longer than the
+    // default two minutes, after which the lock would be taken over and the edits clobbered
+    crate::state::FileLock::acquire_with(std::env::temp_dir().join(format!("doctest-{}.lock", &key[..16])), 3600)
+}
+
+/// Writes a test file whole or not at all (a temp file renamed over it), so a test run never loads half a file.
+pub fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
+    let dir = file.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // not named *Test.php, so PHPUnit never picks the temp file up
+    let tmp = dir.join(format!(".{name}.{}.doctest-tmp", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", file.display())
+    })
+}
+
+static PROVIDER_ATTR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ \t]*#\[\s*\\?(?:[\w\\]*\\)?DataProvider\s*\([^\n]*\)\s*\][ \t]*\r?\n?").unwrap()
+});
+
+/// `method_php` without data-provider attributes (doctest writes the provider `cases_<method>` itself); refused
+/// when it holds more than the one method.
+fn sanitize_method(code: &str, method: &str) -> Result<String, String> {
+    let code = PROVIDER_ATTR.replace_all(code, "").into_owned();
+    let mask = php_code_mask(&code);
+    let names: Vec<String> = FUNC
+        .captures_iter(&code)
+        .filter(|c| c.get(0).is_some_and(|m| mask.get(m.start()).copied().unwrap_or(false)))
+        .map(|c| c[1].to_string())
+        .collect();
+    if names.len() > 1 {
+        return Err(format!(
+            "method_php holds {} functions ({}): send only public function {method}(...); doctest writes its data provider cases_{method} from rows itself",
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    Ok(code)
+}
+
+/// Lines of a docblock without `@dataProvider` (doctest names its own provider).
+fn without_provider_lines(lines: Vec<String>) -> Vec<String> {
+    lines.into_iter().filter(|l| !l.starts_with("@dataProvider")).collect()
+}
+
+/// Removes these rows (and their bug notes and continuation lines) from provider `name`.
+fn drop_rows(text: &str, name: &str, cases: &[String]) -> String {
+    let Some((s, e)) = function_span(text, name) else {
+        return text.to_string();
+    };
+    let mut kept = Vec::new();
+    let mut lines = text[s..e].lines().peekable();
+    let mut pending_note: Option<String> = None;
+    while let Some(line) = lines.next() {
+        if line.trim().starts_with("// @doctest-bug ") {
+            pending_note = Some(line.to_string());
+            continue;
+        }
+        if let Some(c) = ROW_KEY.captures(line)
+            && cases.contains(&c[1].replace("\\'", "'"))
+        {
+            pending_note = None;
+            let mut depth: i32 = bracket_delta(line);
+            while depth > 0 {
+                let Some(next) = lines.next() else { break };
+                depth += bracket_delta(next);
+            }
+            continue;
+        }
+        if let Some(n) = pending_note.take() {
+            kept.push(n);
+        }
+        kept.push(line.to_string());
+    }
+    let mut replacement = kept.join("\n");
+    if text[s..e].ends_with('\n') {
+        replacement.push('\n');
+    }
+    let mut out = text.to_string();
+    out.replace_range(s..e, &replacement);
+    out
+}
+
+/// Makes method `m` a test (public, with its provider attribute) or a helper only its `_known_bugs` test calls
+/// (protected: a method with no rows of its own would be an empty data set, which PHPUnit reports as an error).
+fn set_test(text: &str, m: &str, test: bool) -> String {
+    let Some((s, e)) = function_span(text, m) else {
+        return text.to_string();
+    };
+    let span = &text[s..e];
+    let sig = Regex::new(&format!(
+        r"(?m)^([ \t]*)(?:public|protected|private)?\s*function\s+{}\s*\(",
+        regex::escape(m)
+    ))
+    .unwrap();
+    let Some(c) = sig.captures(span) else {
+        return text.to_string();
+    };
+    let whole = c.get(0).expect("match");
+    let indent = c[1].to_string();
+    let attr = format!("{indent}#[{DP}('cases_{m}')]\n");
+    let head = &span[..whole.start()];
+    let mut head = head.replace(&attr, "");
+    let rest = &span[whole.end()..];
+    let new_sig = if test {
+        head += &attr;
+        format!("{indent}public function {m}(")
+    } else {
+        format!("{indent}protected function {m}(")
+    };
+    let mut out = text.to_string();
+    out.replace_range(s..e, &format!("{head}{new_sig}{rest}"));
+    out
+}
+
+/// After rows changed: no rows left → the method and its providers go; only bug rows → the method becomes a
+/// helper; no bug rows → the bug section goes. Only functions inside the doctest block are touched.
+fn settle_method(mut text: String, m: &str) -> String {
+    let in_block = |text: &str, name: &str| -> bool {
+        match (text.find(START), text.find(END), function_span(text, name)) {
+            (Some(s), Some(e), Some((fs, fe))) => fs >= s && fe <= e,
+            _ => false,
+        }
+    };
+    let remove_in_block = |text: &mut String, name: &str| {
+        if in_block(text, name)
+            && let Some((s, e)) = function_span(text, name)
+        {
+            text.replace_range(s..e, "");
+        }
+    };
+    let bugs = provider_rows(&text, &format!("bugs_{m}")).len();
+    let main = provider_rows(&text, &format!("cases_{m}")).len();
+    if bugs == 0 {
+        for f in [format!("{m}_known_bugs"), format!("bugs_{m}")] {
+            remove_in_block(&mut text, &f);
+        }
+    }
+    if main == 0 && bugs == 0 {
+        for f in [m.to_string(), format!("cases_{m}")] {
+            remove_in_block(&mut text, &f);
+        }
+    } else if in_block(&text, m) {
+        text = set_test(&text, m, main > 0);
+    }
+    let tidy = Regex::new(&format!(r"{}\n\s*\n(\s*{})", regex::escape(START), regex::escape(END))).unwrap();
+    tidy.replace(&text, format!("{START}\n$1")).into_owned()
 }
 
 /// Row keys of provider `name` in `text`, with the bug note of each row.
@@ -427,11 +607,40 @@ pub fn insert_unlocked(file: &Path, class: &str, namespace: &str, target: &str, 
         .ok_or_else(|| format!("{}: {START} without {END}", file.display()))?;
     let block = &text[block_start..block_end];
     let ours = block.contains(&format!("function cases_{m}("));
-    let existing: Vec<String> = provider_rows(block, &format!("cases_{m}"))
+    let main_rows: Vec<String> = provider_rows(block, &format!("cases_{m}"))
         .into_iter()
-        .chain(provider_rows(block, &format!("bugs_{m}")))
         .map(|(k, _)| k)
         .collect();
+    let bug_rows: Vec<String> = provider_rows(block, &format!("bugs_{m}"))
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    // a row sent again with its bug note added or taken away moves between the two providers
+    let to_bugs: Vec<String> = t
+        .rows
+        .iter()
+        .filter(|r| r.bug.is_some() && main_rows.contains(&r.case))
+        .map(|r| r.case.clone())
+        .collect();
+    let to_main: Vec<String> = t
+        .rows
+        .iter()
+        .filter(|r| r.bug.is_none() && bug_rows.contains(&r.case))
+        .map(|r| r.case.clone())
+        .collect();
+    if !to_bugs.is_empty() {
+        text = drop_rows(&text, &format!("cases_{m}"), &to_bugs);
+    }
+    if !to_main.is_empty() {
+        text = drop_rows(&text, &format!("bugs_{m}"), &to_main);
+    }
+    let existing: Vec<String> = main_rows
+        .iter()
+        .chain(&bug_rows)
+        .filter(|k| !to_bugs.contains(k) && !to_main.contains(k))
+        .cloned()
+        .collect();
+    let block_end = text.find(END).unwrap_or(block_end);
     for r in &t.rows {
         if existing.contains(&r.case) || t.rows.iter().filter(|x| x.case == r.case).count() > 1 {
             return Err(format!(
@@ -460,6 +669,7 @@ pub fn insert_unlocked(file: &Path, class: &str, namespace: &str, target: &str, 
                 text.insert_str(end, &bug_section(target, m, &render_rows(&bugs, true)));
             }
         }
+        text = settle_method(text, m);
     } else {
         if FUNC.captures_iter(&text).any(|c| &c[1] == m) {
             return Err(format!(
@@ -480,11 +690,13 @@ pub fn insert_unlocked(file: &Path, class: &str, namespace: &str, target: &str, 
                     .map(|l| l.trim().trim_start_matches('*').trim().to_string())
                     .filter(|l| !l.is_empty())
                     .collect();
-                (lines, rest[end + 2..].trim().to_string())
+                (without_provider_lines(lines), rest[end + 2..].trim().to_string())
             }
             None => (Vec::new(), php.to_string()),
         };
-        match FUNC.captures(&code) {
+        let code = sanitize_method(&code, m)?;
+        let code = code.trim();
+        match FUNC.captures(code) {
             Some(c) if &c[1] == m => {}
             _ => return Err(format!("method_php must define public function {m}(...)")),
         }
@@ -495,7 +707,7 @@ pub fn insert_unlocked(file: &Path, class: &str, namespace: &str, target: &str, 
         doc += "     */\n";
         let mut section = format!(
             "\n{doc}    #[{DP}('cases_{m}')]\n{}\n\n{}",
-            reindent(&code, 4),
+            reindent(code, 4),
             provider(&format!("cases_{m}"), &render_rows(&normal, false))
         );
         if !bugs.is_empty() {
@@ -503,11 +715,12 @@ pub fn insert_unlocked(file: &Path, class: &str, namespace: &str, target: &str, 
         }
         let end_line = text[..block_end].rfind('\n').map(|i| i + 1).unwrap_or(block_end);
         text.insert_str(end_line, &section);
+        if normal.is_empty() {
+            // only bug rows: the method is a helper of its _known_bugs test, not a test with an empty data set
+            text = set_test(&text, m, false);
+        }
     }
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    }
-    std::fs::write(file, text).map_err(|e| format!("cannot write {}: {e}", file.display()))
+    write_atomic(file, &text)
 }
 
 /// Replaces the signature and body of doctest method `method`, keeping its docblock, attributes and providers.
@@ -528,6 +741,7 @@ pub fn replace_method_unlocked(file: &Path, method: &str, method_php: &str) -> R
         Some(c) => c,
         None => code.to_string(),
     };
+    let code = sanitize_method(&code, method)?.trim().to_string();
     match FUNC.captures(&code) {
         Some(c) if &c[1] == method => {}
         _ => return Err(format!("method_php must define public function {method}(...)")),
@@ -541,9 +755,14 @@ pub fn replace_method_unlocked(file: &Path, method: &str, method_php: &str) -> R
     ))
     .unwrap();
     let at = sig.find(span).map(|m| m.start()).ok_or("signature not found")?;
+    let was_test = span.contains(&format!("public function {method}("));
     let replacement = format!("{}{}\n", &span[..at], reindent(&code, 4));
     text.replace_range(s..e, &replacement);
-    std::fs::write(file, text).map_err(|e| format!("cannot write {}: {e}", file.display()))
+    let main_rows = provider_rows(&text, &format!("cases_{method}")).len();
+    if !was_test || main_rows == 0 {
+        text = set_test(&text, method, main_rows > 0);
+    }
+    write_atomic(file, &text)
 }
 
 /// Inserts row text before the closing `];` of provider `name`.
@@ -560,6 +779,7 @@ fn add_rows(text: &str, name: &str, rows: &str) -> Result<String, String> {
 }
 
 /// Removes rows from `method`'s providers; when none are left the method and its providers go too.
+#[cfg(test)]
 pub fn remove_rows(file: &Path, method: &str, cases: &[String]) -> Result<(), String> {
     let _lock = file_lock(file)?;
     remove_rows_unlocked(file, method, cases)
@@ -581,63 +801,11 @@ pub fn remove_rows_unlocked(file: &Path, method: &str, cases: &[String]) -> Resu
             file.display()
         ));
     }
-    let mut text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let mut text = original;
     for provider_name in [format!("cases_{method}"), format!("bugs_{method}")] {
-        let Some((s, e)) = function_span(&text, &provider_name) else {
-            continue;
-        };
-        let mut kept = Vec::new();
-        let mut lines = text[s..e].lines().peekable();
-        let mut pending_note: Option<String> = None;
-        while let Some(line) = lines.next() {
-            if line.trim().starts_with("// @doctest-bug ") {
-                pending_note = Some(line.to_string());
-                continue;
-            }
-            if let Some(c) = ROW_KEY.captures(line)
-                && cases.contains(&c[1].replace("\\'", "'"))
-            {
-                pending_note = None;
-                // skip continuation lines of a multi-line row
-                let mut depth: i32 = bracket_delta(line);
-                while depth > 0 {
-                    let Some(next) = lines.next() else { break };
-                    depth += bracket_delta(next);
-                }
-                continue;
-            }
-            if let Some(n) = pending_note.take() {
-                kept.push(n);
-            }
-            kept.push(line.to_string());
-        }
-        let mut replacement = kept.join("\n");
-        if text[s..e].ends_with('\n') {
-            replacement.push('\n');
-        }
-        text.replace_range(s..e, &replacement);
+        text = drop_rows(&text, &provider_name, cases);
     }
-    let block_rows = |t: &str, p: &str| provider_rows(t, p).len();
-    let remove_in_block = |text: &mut String, name: &str| {
-        if in_block(text, name)
-            && let Some((s, e)) = function_span(text, name)
-        {
-            text.replace_range(s..e, "");
-        }
-    };
-    if block_rows(&text, &format!("bugs_{method}")) == 0 {
-        for f in [format!("{method}_known_bugs"), format!("bugs_{method}")] {
-            remove_in_block(&mut text, &f);
-        }
-    }
-    if block_rows(&text, &format!("cases_{method}")) == 0 && !text.contains(&format!("function bugs_{method}(")) {
-        for f in [method.to_string(), format!("cases_{method}")] {
-            remove_in_block(&mut text, &f);
-        }
-    }
-    let tidy = Regex::new(&format!(r"{}\n\s*\n(\s*{})", regex::escape(START), regex::escape(END))).unwrap();
-    text = tidy.replace(&text, format!("{START}\n$1")).into_owned();
-    std::fs::write(file, text).map_err(|e| format!("cannot write {}: {e}", file.display()))
+    write_atomic(file, &settle_method(text, method))
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -687,6 +855,19 @@ pub fn same_method(printed: &str, method: &str) -> bool {
     norm_name(base) == norm_name(method)
 }
 
+/// A data-set name as printed and a row's case key are the same case (Collision prints `partly_paid` as
+/// `partly paid`).
+pub fn same_case(printed: &str, case: &str) -> bool {
+    let n = |s: &str| {
+        s.to_lowercase()
+            .replace('_', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    n(printed) == n(case)
+}
+
 impl RunResult {
     pub fn failed_cases(&self, method: &str) -> Vec<String> {
         cases_of(&self.failed.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), method)
@@ -695,14 +876,52 @@ impl RunResult {
     pub fn passed_cases(&self, method: &str) -> Vec<String> {
         cases_of(&self.passed.iter().map(String::as_str).collect::<Vec<_>>(), method)
     }
+
+    /// How row `case` of `method` did: Some(true) passed, Some(false) failed, None not run at all.
+    pub fn row(&self, method: &str, case: &str) -> Option<bool> {
+        if self.failed_cases(method).iter().any(|c| same_case(c, case)) {
+            Some(false)
+        } else if self.passed_cases(method).iter().any(|c| same_case(c, case)) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Why row `case` of `method` failed: the file:line and the first lines of PHPUnit's message (the entry with
+    /// text when the run printed the name more than once).
+    pub fn failure(&self, method: &str, case: &str) -> (Option<String>, String) {
+        let hits: Vec<&(String, String, Option<String>)> = self
+            .failed
+            .iter()
+            .filter(|(name, _, _)| cases_of(&[name.as_str()], method).iter().any(|c| same_case(c, case)))
+            .collect();
+        let at = hits.iter().find_map(|h| h.2.clone());
+        let text = hits
+            .iter()
+            .map(|h| h.1.as_str())
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
+        (at, text.to_string())
+    }
 }
 
 static DURATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+\d+(?:\.\d+)?m?s$").unwrap());
 static PHPUNIT_FAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\) [^\s:]+::(.+)$").unwrap());
 static AT_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|\s|at\s)(\S+\.php:\d+)\s*$").unwrap());
 
-/// Results from `php artisan test` (Collision) or plain PHPUnit output.
+static ANSI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r").unwrap());
+
+/// Output without colour and cursor codes.
+pub fn strip_ansi(out: &str) -> String {
+    ANSI.replace_all(out, "").into_owned()
+}
+
+/// Results from `php artisan test` (Collision) or plain PHPUnit output, coloured or not.
 pub fn parse_output(out: &str) -> RunResult {
+    let out = strip_ansi(out);
+    let out = out.as_str();
     let mut r = RunResult {
         output: out.to_string(),
         ..RunResult::default()
@@ -710,7 +929,15 @@ pub fn parse_output(out: &str) -> RunResult {
     let lines: Vec<&str> = out.lines().collect();
     for l in &lines {
         let t = l.trim();
-        for (mark, passed) in [("✓", true), ("✔", true), ("⨯", false), ("✘", false), ("×", false)] {
+        for (mark, passed) in [
+            ("✓", true),
+            ("✔", true),
+            ("⨯", false),
+            ("✘", false),
+            ("×", false),
+            ("✕", false),
+            ("✗", false),
+        ] {
             if let Some(rest) = t.strip_prefix(mark) {
                 let name = DURATION.replace(rest.trim(), "").trim().to_string();
                 if passed {
@@ -743,7 +970,15 @@ pub fn parse_output(out: &str) -> RunResult {
                 i += 1;
             }
             let text = body.join("\n").trim().to_string();
-            match r.failed.iter_mut().find(|f| f.0 == name) {
+            let key = |n: &str| {
+                n.to_lowercase()
+                    .replace('_', " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let short = |n: &str| key(n).strip_prefix("test ").map(String::from).unwrap_or_else(|| key(n));
+            match r.failed.iter_mut().find(|f| short(&f.0) == short(&name)) {
                 Some(f) => {
                     f.1 = text;
                     f.2 = at;
@@ -784,12 +1019,53 @@ pub fn filter_for(class: &str, methods: &[String]) -> String {
     format!("/{class}::(?:{})\\b/", methods.join("|"))
 }
 
-/// Runs `[tests] run` with `--filter '<filter>'` in the backend repo.
+/// `value` quoted for where `{filter}` stands in the run line: inside a single-quoted `sh -c '…'` it is double
+/// quoted for the inner shell, elsewhere single quoted.
+pub fn quote_for(template: &str, value: &str) -> String {
+    let at = template.find("{filter}").unwrap_or(0);
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev = ' ';
+    for ch in template[..at].chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single && prev != '\\' => in_double = !in_double,
+            _ => {}
+        }
+        prev = ch;
+    }
+    if in_single {
+        let v = value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`");
+        if value.contains('\'') {
+            // a single quote cannot stand inside the outer single quotes: close, add it escaped, reopen
+            format!("\"{}\"", v.replace('\'', "'\\''"))
+        } else {
+            format!("\"{v}\"")
+        }
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Runs `[tests] run` with `--filter <filter>` in the backend repo; with `file`, only that test file is loaded
+/// (another worker's file being written cannot break the run).
 pub fn run(cfg: &Config, filter: &str) -> Result<RunResult, String> {
-    let cmd = cfg
-        .tests
-        .run
-        .replace("{filter}", &format!("--filter '{}'", filter.replace('\'', "'\\''")));
+    run_in(cfg, None, filter)
+}
+
+pub fn run_in(cfg: &Config, file: Option<&str>, filter: &str) -> Result<RunResult, String> {
+    let t = &cfg.tests.run;
+    let mut arg = String::new();
+    if let Some(f) = file {
+        arg += &quote_for(t, f);
+        arg.push(' ');
+    }
+    arg += &format!("--filter {}", quote_for(t, filter));
+    let cmd = t.replace("{filter}", &arg);
     let out = Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -803,6 +1079,7 @@ pub fn run(cfg: &Config, filter: &str) -> Result<RunResult, String> {
     );
     let r = parse_output(&text);
     if r.passed.is_empty() && r.failed.is_empty() {
+        let text = strip_ansi(&text);
         if out.status.success() {
             return Err(format!("`{cmd}` ran no tests:\n{}", tail(&text, 40)));
         }
@@ -813,10 +1090,7 @@ pub fn run(cfg: &Config, filter: &str) -> Result<RunResult, String> {
 
 /// Runs `[tests] run` on these test files (paths relative to the backend).
 pub fn run_files(cfg: &Config, files: &[String]) -> Result<RunResult, String> {
-    let args: Vec<String> = files
-        .iter()
-        .map(|f| format!("'{}'", f.replace('\'', "'\\''")))
-        .collect();
+    let args: Vec<String> = files.iter().map(|f| quote_for(&cfg.tests.run, f)).collect();
     let cmd = cfg.tests.run.replace("{filter}", &args.join(" "));
     let out = Command::new("sh")
         .arg("-c")
@@ -831,7 +1105,7 @@ pub fn run_files(cfg: &Config, files: &[String]) -> Result<RunResult, String> {
     );
     let r = parse_output(&text);
     if r.passed.is_empty() && r.failed.is_empty() && !out.status.success() {
-        return Err(format!("`{cmd}` failed:\n{}", tail(&text, 60)));
+        return Err(format!("`{cmd}` failed:\n{}", tail(&strip_ansi(&text), 60)));
     }
     Ok(r)
 }
@@ -1236,5 +1510,128 @@ mod tests {
     #[test]
     fn reindent_handles_non_ascii_spaces() {
         assert_eq!(reindent("\u{a0}\u{a0}a\n\u{a0}\u{a0}  b", 4), "    a\n      b");
+    }
+
+    #[test]
+    fn filter_quoting_fits_the_run_line() {
+        let f = "/FooTest::(?:test_bar)\\b/";
+        assert_eq!(
+            quote_for("php artisan test {filter}", f),
+            "'/FooTest::(?:test_bar)\\b/'"
+        );
+        // inside sh -c '...': double quotes for the inner shell, the backslash kept
+        let q = quote_for("docker exec app sh -c 'cd /srv/api && php artisan test {filter}'", f);
+        assert_eq!(q, "\"/FooTest::(?:test_bar)\\\\b/\"");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c 'printf %s {q}'"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), f);
+        // inside double quotes the single quotes reach the inner shell
+        assert_eq!(quote_for("sh -c \"php artisan test {filter}\"", "a b"), "'a b'");
+    }
+
+    #[test]
+    fn collision_output_from_a_real_run_is_read() {
+        // php artisan test on irems, colours on: underscores in the data-set name are printed as spaces
+        let out = "  \x1b[30;42;1m PASS \x1b[39;49;22m\x1b[39m Tests\\Feature\\VendorTest\x1b[39m\n  \x1b[32;1m✓\x1b[39;22m\x1b[90m \x1b[39m\x1b[90mshow doctest with data set \"ok\"\x1b[39m\x1b[90m      \x1b[39m \x1b[90m1.07s\x1b[39m  \n  \x1b[32;1m✓\x1b[39;22m\x1b[90m \x1b[39m\x1b[90mshow doctest with data set \"state:md5 password upgraded\"\x1b[39m\x1b[90m  \x1b[39m \x1b[90m0.71s\x1b[39m  \n\n  \x1b[90mTests:\x1b[39m    \x1b[32;1m2 passed\x1b[39;22m\x1b[90m (7 assertions)\x1b[39m\n";
+        let r = parse_output(out);
+        assert_eq!(r.row("test_show_doctest", "ok"), Some(true));
+        assert_eq!(r.row("test_show_doctest", "state:md5_password_upgraded"), Some(true));
+        assert_eq!(r.row("test_show_doctest_known_bugs", "ok"), None);
+    }
+
+    #[test]
+    fn coloured_output_is_read() {
+        let r = parse_output("  \x1b[32;1m✓\x1b[0m store with data set \"ok\"   \x1b[2m0.12s\x1b[22m\r\n");
+        assert_eq!(r.passed, vec!["store with data set \"ok\""]);
+        assert_eq!(r.row("test_store", "ok"), Some(true));
+        assert_eq!(r.row("test_store", "guest"), None);
+        assert!(same_case("returns:partly paid", "returns:partly_paid"));
+    }
+
+    #[test]
+    fn bug_only_method_is_a_helper_and_rows_move_between_providers() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("OrderControllerTest.php");
+        let mut bug = row("forbidden", "403");
+        bug.bug = Some("lets anyone in".into());
+        let t = NewTests {
+            method: "test_store".into(),
+            method_php: Some(BODY.into()),
+            rows: vec![bug],
+        };
+        insert(&f, "OrderControllerTest", "Tests\\Feature", TARGET, &t).unwrap();
+        let php = fs::read_to_string(&f).unwrap();
+        assert!(php.contains("protected function test_store("), "{php}");
+        assert!(
+            !php.contains("#[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_test_store')]"),
+            "{php}"
+        );
+        assert!(php.contains("public function test_store_known_bugs("), "{php}");
+        // the row comes back without bug: it moves to the main provider, the method is a test again
+        let t = NewTests {
+            method: "test_store".into(),
+            method_php: None,
+            rows: vec![row("forbidden", "403")],
+        };
+        insert(&f, "OrderControllerTest", "Tests\\Feature", TARGET, &t).unwrap();
+        let php = fs::read_to_string(&f).unwrap();
+        assert!(php.contains("public function test_store("), "{php}");
+        assert!(
+            php.contains("#[\\PHPUnit\\Framework\\Attributes\\DataProvider('cases_test_store')]"),
+            "{php}"
+        );
+        assert!(!php.contains("known_bugs") && !php.contains("@doctest-bug"), "{php}");
+        assert_eq!(provider_rows(&php, "cases_test_store").len(), 1);
+    }
+
+    #[test]
+    fn method_php_with_its_own_provider_method_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("OrderControllerTest.php");
+        let t = NewTests {
+            method: "test_store".into(),
+            method_php: Some(format!("{BODY}\npublic static function mine(): array {{ return []; }}")),
+            rows: vec![row("ok", "200")],
+        };
+        let e = insert(&f, "OrderControllerTest", "Tests\\Feature", TARGET, &t).unwrap_err();
+        assert!(e.contains("cases_test_store") && e.contains("mine"), "{e}");
+    }
+
+    #[test]
+    fn same_named_controllers_get_their_own_test_files() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = shop_config(d.path());
+        cfg.backend = d.path().to_path_buf();
+        for c in [
+            "app/Http/Controllers/Ap/CreditNoteController.php",
+            "app/Http/Controllers/Ar/Collection/CreditNoteController.php",
+        ] {
+            fs::create_dir_all(d.path().join(c).parent().unwrap()).unwrap();
+            fs::write(d.path().join(c), "<?php").unwrap();
+        }
+        let ap = d
+            .path()
+            .join("tests/Feature/Http/Controllers/Ap/CreditNoteControllerTest.php");
+        fs::create_dir_all(ap.parent().unwrap()).unwrap();
+        fs::write(
+            &ap,
+            "<?php\nnamespace Tests\\Feature\\Http\\Controllers\\Ap;\nclass CreditNoteControllerTest {}\n",
+        )
+        .unwrap();
+        let (f, _, ns) = target_file(
+            &cfg,
+            "",
+            "App\\Http\\Controllers\\Ar\\Collection\\CreditNoteController@store",
+        );
+        assert!(
+            f.ends_with("tests/Feature/Http/Controllers/Ar/Collection/CreditNoteControllerTest.php"),
+            "{f:?}"
+        );
+        assert_eq!(ns, "Tests\\Feature\\Http\\Controllers\\Ar\\Collection");
+        let (f, _, _) = target_file(&cfg, "", "App\\Http\\Controllers\\Ap\\CreditNoteController@store");
+        assert_eq!(f, ap);
     }
 }

@@ -6,6 +6,22 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- Tests: each row is judged by its own data set in the run (coloured output is read, a key printed with spaces
+  for underscores is still matched); a row that did not run is not kept, and a run where no row ran (an invalid
+  data provider, a file that does not parse) rolls the write back; a removed row says why (file:line and
+  PHPUnit's message). The run loads only the target's test file, the write and run hold the test runner, and test
+  files are written whole, so another worker's half-written file cannot break a run; `{filter}` inside
+  `sh -c '…'` is quoted for the inner shell. A target with only bug rows keeps its method as a helper (no empty
+  data set); a row sent again with or without `bug` moves between the two providers; removing every row and
+  replacing the body in one call writes the method anew; `method_php` loses any DataProvider attribute of its
+  own and is refused with a second function. Same-named controllers get their own test files (by namespace).
+- Test work: a route parameter needs a not_found case only when the action looks a record up with it (a bound
+  model, find/findOrFail…), not for flags or labels; extra rows (returns:<value>, state:, filter:, a rule doctest
+  does not list) are not called obsolete; package routes (controllers outside the app's composer namespaces, like
+  Passport's oauth/*) are not test targets; `write_test skip` and `[tests] exclude` take targets out; claiming
+  again hands back unworked items to the end of the queue, claims last an hour and `renew` keeps them; cases and
+  write_test read coverage the way status does.
+
 - check: `--changed` (guides git sees changed) and route keys or guide paths narrow it; page facts are built once per
   page and cached between runs; the progress line says about how long is left. A missing action section is an
   error only for the page's own call whose control is on screen (disabled controls do not count), otherwise a

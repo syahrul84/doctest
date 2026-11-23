@@ -33,6 +33,9 @@ pub struct State {
     pub written: Vec<String>,
     /// When the current run started (unix seconds): the first status, plan or claim after a finish.
     pub run_started: Option<u64>,
+    /// Test targets marked as not testable under PHPUnit (target → why): exit(), dd(), real network, package routes.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub untestable: BTreeMap<String, String>,
 }
 
 /// A lock held by creating a file; removed on drop. A lock older than two minutes is taken over.
@@ -90,7 +93,7 @@ impl Drop for FileLock {
     }
 }
 
-pub const CLAIM_SECONDS: u64 = 30 * 60;
+pub const CLAIM_SECONDS: u64 = 60 * 60;
 
 pub fn now() -> u64 {
     std::time::SystemTime::now()
@@ -206,22 +209,43 @@ impl State {
         self.ledger = fresh.ledger.clone();
     }
 
-    /// Up to `count` queued items not claimed by another worker (claims expire after 30 minutes).
+    /// Up to `count` queued items not claimed by another worker (claims expire after an hour).
     #[cfg(test)]
     pub fn claim(&mut self, worker: &str, count: usize, now: u64) -> Vec<String> {
         self.claim_where(worker, count, now, &|_| true)
     }
 
     /// Claims only items `wanted` accepts (a queue, kinds or portals).
+    /// A worker claiming again hands back what it still holds: those items go to the end of the queue, so a worker
+    /// never gets the same unworked window twice.
     pub fn claim_where(&mut self, worker: &str, count: usize, now: u64, wanted: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let returned: Vec<String> = self
+            .queue
+            .iter()
+            .filter(|id| {
+                wanted(id)
+                    && self
+                        .claims
+                        .get(*id)
+                        .is_some_and(|(w, at)| w == worker && now.saturating_sub(*at) <= CLAIM_SECONDS)
+            })
+            .cloned()
+            .collect();
+        if !returned.is_empty() {
+            for id in &returned {
+                self.claims.remove(id);
+            }
+            self.queue.retain(|q| !returned.contains(q));
+            self.queue.extend(returned.iter().cloned());
+        }
         let mut out = Vec::new();
-        for id in self.queue.iter().filter(|id| wanted(id)) {
+        for id in self.queue.iter().filter(|id| wanted(id) && !returned.contains(id)) {
             if out.len() >= count {
                 break;
             }
             let free = match self.claims.get(id) {
                 None => true,
-                Some((w, at)) => w == worker || now.saturating_sub(*at) > CLAIM_SECONDS,
+                Some((_, at)) => now.saturating_sub(*at) > CLAIM_SECONDS,
             };
             if free {
                 out.push(id.clone());
@@ -229,6 +253,18 @@ impl State {
         }
         for id in &out {
             self.claims.insert(id.clone(), (worker.to_string(), now));
+        }
+        out
+    }
+
+    /// The items `worker` holds, kept for another hour.
+    pub fn renew_claims(&mut self, worker: &str, now: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, (w, at)) in self.claims.iter_mut() {
+            if w == worker && now.saturating_sub(*at) <= CLAIM_SECONDS && self.queue.contains(id) {
+                *at = now;
+                out.push(id.clone());
+            }
         }
         out
     }
@@ -337,9 +373,25 @@ mod tests {
         assert_eq!(b, vec!["guide:en:p2", "guide:en:p3"]);
         st.done("guide:en:p0");
         assert!(!st.queue.contains(&"guide:en:p0".to_string()) && !st.claims.contains_key("guide:en:p0"));
-        // 31 minutes after w1 claimed, its remaining claim has expired; w2 claimed 11 minutes ago
-        let c = st.claim("w3", 5, 1000 + 31 * 60);
+        // 61 minutes after w1 claimed, its remaining claim has expired; w2 claimed 41 minutes ago
+        let c = st.claim("w3", 5, 1000 + 61 * 60);
         assert_eq!(c, vec!["guide:en:p1", "guide:en:p4"]);
+    }
+
+    #[test]
+    fn claiming_again_hands_back_unworked_items() {
+        let mut st = State {
+            queue: (0..6).map(|i| format!("tests:t{i}")).collect(),
+            ..State::default()
+        };
+        assert_eq!(st.claim("w1", 2, 1000), vec!["tests:t0", "tests:t1"]);
+        // w1 worked none of them: the next claim gives new items and puts t0, t1 at the end
+        assert_eq!(st.claim("w1", 2, 1100), vec!["tests:t2", "tests:t3"]);
+        assert_eq!(st.queue.last().map(String::as_str), Some("tests:t1"));
+        assert_eq!(st.claim("w2", 3, 1200), vec!["tests:t4", "tests:t5", "tests:t0"]);
+        // renewing keeps w1's claim past the hour
+        assert_eq!(st.renew_claims("w1", 1000 + 50 * 60), vec!["tests:t2", "tests:t3"]);
+        assert!(st.claim("w3", 5, 1000 + 70 * 60).iter().all(|i| i != "tests:t2"));
     }
 
     #[test]

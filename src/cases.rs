@@ -53,7 +53,92 @@ pub fn endpoint_target(e: &Endpoint) -> String {
     format!("{} {}", e.method, e.uri)
 }
 
-pub fn for_endpoint(e: &Endpoint) -> Vec<Case> {
+/// The action's PHP source (the controller method), read from `e.at` in the backend.
+pub fn action_source(backend: &std::path::Path, e: &Endpoint) -> Option<String> {
+    let at = e.at.as_deref()?;
+    let file = at.rsplit_once(':').map(|(f, _)| f).unwrap_or(at);
+    let text = std::fs::read_to_string(backend.join(file)).ok()?;
+    let method = e.action.rsplit_once('@').map(|(_, m)| m).unwrap_or("__invoke");
+    let (s, end) = crate::testwrite::function_span(&text, method)?;
+    Some(text[s..end].to_string())
+}
+
+static SIG_PARAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:\??([A-Za-z_\\][\w\\]*)\s+)?&?\$(\w+)").unwrap());
+const SCALARS: [&str; 9] = [
+    "string", "int", "integer", "bool", "float", "array", "mixed", "null", "?string",
+];
+
+/// Whether a route parameter names a record the action looks up (so a missing one answers 404): a model bound by
+/// name (`Order $order`), or a value passed to find/findOrFail/firstOrFail/abort. A flag or label (`{gto}` 0/1,
+/// `{floor}`) used only in conditions does not.
+pub fn names_record(uri: &str, src: &str) -> bool {
+    let params: Vec<String> = uri
+        .split('{')
+        .skip(1)
+        .filter_map(|p| p.split('}').next())
+        .map(|p| p.trim_end_matches('?').split(':').next().unwrap_or(p).to_string())
+        .collect();
+    if params.is_empty() {
+        return false;
+    }
+    let Some(open) = src.find("function") else { return true };
+    let after = &src[open..];
+    let (Some(lp), Some(rp)) = (after.find('('), after.find(')')) else {
+        return true;
+    };
+    if rp < lp {
+        return true;
+    }
+    let sig = &after[lp + 1..rp];
+    let body = &after[rp..];
+    let norm = |s: &str| s.to_lowercase().replace('_', "");
+    let mut scalar_vars: Vec<String> = Vec::new();
+    for c in SIG_PARAM.captures_iter(sig) {
+        let ty = c.get(1).map(|m| m.as_str()).unwrap_or("");
+        let var = c[2].to_string();
+        let class = ty
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase() || ch == '\\')
+            && !SCALARS.contains(&ty.to_lowercase().as_str());
+        if class {
+            // route model binding: a class parameter named like a route parameter
+            let short = ty.rsplit('\\').next().unwrap_or(ty);
+            if !short.ends_with("Request") && params.iter().any(|p| norm(p) == norm(&var)) {
+                return true;
+            }
+        } else {
+            scalar_vars.push(var);
+        }
+    }
+    // a scalar parameter: by name, else by position among the scalar ones
+    let mut vars: Vec<String> = Vec::new();
+    for (i, p) in params.iter().enumerate() {
+        match scalar_vars.iter().find(|v| norm(v) == norm(p)) {
+            Some(v) => vars.push(v.clone()),
+            None => {
+                if let Some(v) = scalar_vars.get(i) {
+                    vars.push(v.clone());
+                }
+            }
+        }
+    }
+    static LOOKUP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:find\w*|first\w*|sole|value|exists|abort\w*|(?:get|fetch|load|show)\w*)\s*\(|ModelNotFound|NotFoundHttpException").unwrap()
+    });
+    body.split([';', '{', '}']).any(|stmt| {
+        vars.iter().any(|v| {
+            Regex::new(&format!(r"\${}\b", regex::escape(v)))
+                .map(|re| re.is_match(stmt))
+                .unwrap_or(false)
+                && LOOKUP.is_match(stmt)
+        })
+    })
+}
+
+/// Cases of an endpoint; with the backend, the action's source decides whether a route parameter is a record
+/// (not_found) or a plain value.
+pub fn for_endpoint(e: &Endpoint, backend: Option<&std::path::Path>) -> Vec<Case> {
     let target = endpoint_target(e);
     let mut out = Vec::new();
     let mut add = |case: String, why: String| {
@@ -85,7 +170,12 @@ pub fn for_endpoint(e: &Endpoint) -> Vec<Case> {
             ),
         );
     }
-    if e.uri.contains('{') {
+    let record = e.uri.contains('{')
+        && match backend.and_then(|b| action_source(b, e)) {
+            Some(src) => names_record(&e.uri, &src),
+            None => true,
+        };
+    if record {
         add(
             "not_found".into(),
             "the URI names a record: an id that does not exist answers 404".into(),
@@ -185,7 +275,7 @@ mod tests {
 
     #[test]
     fn endpoint_cases() {
-        let c = for_endpoint(&order());
+        let c = for_endpoint(&order(), None);
         assert_eq!(
             keys(&c),
             vec![
@@ -213,7 +303,36 @@ mod tests {
             middleware: vec!["api".into()],
             ..Endpoint::default()
         };
-        assert_eq!(keys(&for_endpoint(&e)), vec!["ok"]);
+        assert_eq!(keys(&for_endpoint(&e, None)), vec!["ok"]);
+    }
+
+    #[test]
+    fn not_found_only_for_record_parameters() {
+        // route model binding
+        assert!(names_record(
+            "orders/{order}",
+            "public function show(Order $order) { return $order; }"
+        ));
+        // a plain id looked up
+        assert!(names_record(
+            "orders/{id}",
+            "public function show(Request $r, $id) {\n $o = Order::findOrFail($id);\n return $o; }"
+        ));
+        // a flag used only in a condition
+        assert!(!names_record(
+            "import/{gto}/download-template",
+            "public function template(Request $request, $gto) {\n if ($gto == 1) { $name = 'gto.xlsx'; } else { $name = 'x.xlsx'; }\n return response()->download($name); }"
+        ));
+        // a label used as a filter value
+        assert!(!names_record(
+            "location/{floor}",
+            "public function index(string $floor) {\n return Location::where('floor', $floor)->paginate(); }"
+        ));
+        // a service class injected beside a scalar parameter is not a binding
+        assert!(!names_record(
+            "report/{year}",
+            "public function show(ReportService $svc, int $year) { return $svc->build($year); }"
+        ));
     }
 
     #[test]

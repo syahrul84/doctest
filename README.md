@@ -78,7 +78,8 @@ allow = ["POST /api/*/search"]        # requests that only read, let through in 
 # per_language = true                 # retake screenshots in every language (default: translations reuse the primary's)
 
 [tests]
-run = "docker exec shop-backend sh -c 'cd /var/www/api && php artisan test {filter}'"
+run = "docker exec shop-backend sh -c 'cd /var/www/api && php artisan test {filter}'"   # {filter}: the test file and --filter, quoted to fit
+# exclude = ["oauth/*", "App\\Console\\Commands\\Sync::*"]  # targets PHPUnit cannot test (also: write_test skip)
 
 [guide]
 modules_from = "../shop-web/src/config/adminMenu.ts"   # menu file: chapters and menu paths
@@ -198,11 +199,11 @@ The MCP tools behind these commands:
 | Tool | Does |
 | --- | --- |
 | `status`, `plan` | What is missing or stale, with overall progress % (`scope`: `changes` since the last `finish`, `branch` since the branch left `base` (main/master), or `all`) |
-| `claim` | For parallel AI workers: each worker gets its own next items (claims expire after 30 min); `queue: "guides"` or `"tests"` keeps guide and test workers apart, `portals: ["admin"]` keeps a worker to some portals (also on `status` and `plan`) |
+| `claim` | For parallel AI workers: each worker gets its own next items (claims expire after an hour, `renew: true` keeps them; claiming again hands back what the worker did not write, to the end of the queue); `queue: "guides"` or `"tests"` keeps guide and test workers apart, `portals: ["admin"]` keeps a worker to some portals (also on `status` and `plan`) |
 | `facts` | Everything for one work item: real labels, texts, endpoints, rules, messages, menu path, skeleton |
 | `write_doc` | Store a guide/translation/system section; refused if it names UI the page lacks |
 | `shoot` | Take or retake a screenshot from a spec; returns the image |
-| `cases`, `write_test` | Expected cases and who covers them; add data-provider rows, run them, keep what passes |
+| `cases`, `write_test` | Expected cases and who covers them; add data-provider rows, run them (only that test file), keep the rows whose own data set passed and report the others with PHPUnit's message; `skip: "why"` marks a target PHPUnit cannot test |
 | `run_tests`, `check`, `build` | Run doctest's tests; check everything (CI); rebuild the HTML |
 | `issues` | Code to fix, as points |
 | `verify_changes` | Validate the current change: pass/fail with points |

@@ -78,6 +78,36 @@ pub fn page_matches(key: &str, path: &str, patterns: &[String]) -> bool {
     })
 }
 
+/// The app's own PHP namespaces (composer.json autoload psr-4: `App\\`, `Modules\\`…); empty when unreadable.
+pub fn app_namespaces(cfg: &Config) -> Vec<String> {
+    std::fs::read_to_string(cfg.backend.join("composer.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["autoload"]["psr-4"].as_object().map(|m| m.keys().cloned().collect()))
+        .unwrap_or_default()
+}
+
+/// A route whose controller is a package's (`Laravel\\Passport\\Http\\Controllers\\…`), not the app's.
+pub fn package_action(action: &str, app_ns: &[String]) -> bool {
+    let class = action.split('@').next().unwrap_or(action).trim_start_matches('\\');
+    !app_ns.is_empty() && class.contains('\\') && !app_ns.iter().any(|ns| class.starts_with(ns.as_str()))
+}
+
+/// `[tests] exclude` patterns (`*` any text) match the target or its URI, or the target is marked not testable.
+pub fn test_excluded(cfg: &Config, st: &State, target: &str) -> bool {
+    if st.untestable.contains_key(target) {
+        return true;
+    }
+    let uri = target
+        .split_once(' ')
+        .filter(|(m, _)| m.chars().all(|c| c.is_ascii_uppercase()))
+        .map(|(_, u)| u);
+    cfg.tests.exclude.iter().any(|p| {
+        let re = format!("^{}$", regex::escape(p).replace("\\*", ".*"));
+        regex::Regex::new(&re).is_ok_and(|r| r.is_match(target) || uri.is_some_and(|u| r.is_match(u)))
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
@@ -762,6 +792,11 @@ pub fn plan_parallel(
         units.extend(r?);
     }
     plan.stale_index |= fb.stale;
+    // a package's routes (Passport oauth/*: its controllers live outside the app's namespaces) and targets marked
+    // as not testable are never test work
+    let app_ns = app_namespaces(cfg);
+    endpoints.retain(|t, e| !package_action(&e.action, &app_ns) && !test_excluded(cfg, state, t));
+    units.retain(|(t, _)| !test_excluded(cfg, state, t));
     let endpoint_list: Vec<Endpoint> = endpoints.values().cloned().collect();
     // endpoints whose action was read (rules, messages); route-list endpoints carry none, so their
     // invalid:/boundary: cases are unknown, not absent
@@ -772,10 +807,11 @@ pub fn plan_parallel(
         .collect();
     let ledger = crate::ledger::scan(cfg, &endpoint_list);
     state.ledger = ledger.clone();
-    let mut all_cases: Vec<Case> = Vec::new();
-    for e in &endpoint_list {
-        all_cases.extend(cases::for_endpoint(e));
-    }
+    let endpoint_cases: Vec<Vec<Case>> = endpoint_list
+        .iter()
+        .map(|e| cases::for_endpoint(e, Some(&cfg.backend)))
+        .collect();
+    let mut all_cases: Vec<Case> = endpoint_cases.iter().flatten().cloned().collect();
     for (target, src) in &units {
         all_cases.extend(cases::for_method(target, src));
     }
@@ -788,26 +824,42 @@ pub fn plan_parallel(
             plan.missing.entry(c.target.clone()).or_default().push(c);
         }
     }
-    // doctest rows whose case or route is gone
-    let derived = |c: &str| {
-        ["ok", "guest", "forbidden", "not_found"].contains(&c)
-            || ["invalid:", "boundary:", "throws:", "returns:"]
-                .iter()
-                .any(|p| c.starts_with(p))
-    };
-    let expected: BTreeMap<String, BTreeSet<String>> = {
-        let mut m: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for e in &endpoint_list {
-            m.entry(cases::endpoint_target(e))
-                .or_default()
-                .extend(cases::for_endpoint(e).into_iter().map(|c| c.case));
+    // doctest rows whose route, or the rule, sign-in or record they test, is gone; rows doctest cannot classify
+    // (returns:<value>, state:, filter:, throws:, a rule it does not list) are extra cases, not obsolete
+    let by_target: BTreeMap<String, &Endpoint> = endpoint_list.iter().map(|e| (cases::endpoint_target(e), e)).collect();
+    let gone_case = |target: &str, case: &str| -> bool {
+        let Some(e) = by_target.get(target) else { return false };
+        let rule_names = |field: &str| -> Option<Vec<String>> {
+            e.rules.get(field).map(|rs| {
+                rs.iter()
+                    .map(|r| r.split(':').next().unwrap_or_default().to_lowercase())
+                    .collect()
+            })
+        };
+        match case {
+            "guest" => !e.middleware.iter().any(|m| m == "auth" || m.starts_with("auth:")),
+            // a not_found row where doctest no longer expects one may still be right (a lookup in a service)
+            "not_found" => !e.uri.contains('{'),
+            _ if case.starts_with("invalid:") && rules_read.contains(target) => {
+                let mut parts = case.splitn(3, ':').skip(1);
+                let (field, rule) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+                match rule_names(field) {
+                    None => true,
+                    Some(names) => rule != "*" && !names.iter().any(|n| n == rule),
+                }
+            }
+            _ if case.starts_with("boundary:") && rules_read.contains(target) => {
+                let mut parts = case.splitn(3, ':').skip(1);
+                let (field, bound) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+                let bounding: &[&str] = if bound == "min" {
+                    &["min", "size", "between", "digits", "digits_between"]
+                } else {
+                    &["max", "size", "between", "digits", "digits_between"]
+                };
+                rule_names(field).is_none_or(|names| !names.iter().any(|n| bounding.contains(&n.as_str())))
+            }
+            _ => false,
         }
-        for (t, src) in &units {
-            m.entry(t.clone())
-                .or_default()
-                .extend(cases::for_method(t, src).into_iter().map(|c| c.case));
-        }
-        m
     };
     let mut obsolete: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new(); // target → (route gone, cases)
     let doctest_rows: Vec<&crate::state::Covered> = ledger
@@ -825,6 +877,9 @@ pub fn plan_parallel(
         BTreeSet::new()
     };
     for c in doctest_rows {
+        if test_excluded(cfg, state, &c.target) {
+            continue;
+        }
         let route = c
             .target
             .split_once(' ')
@@ -835,12 +890,7 @@ pub fn plan_parallel(
             let e = obsolete.entry(c.target.clone()).or_default();
             e.0 = true;
             e.1.push(c.case.clone());
-        } else if let Some(exp) = expected.get(&c.target)
-            && derived(&c.case)
-            && !exp.contains(&c.case)
-            && (rules_read.contains(&c.target) || !(c.case.starts_with("invalid:") || c.case.starts_with("boundary:")))
-            && (route.is_none() || rules_read.contains(&c.target) || !c.case.starts_with("throws:"))
-        {
+        } else if gone_case(&c.target, &c.case) {
             obsolete.entry(c.target.clone()).or_default().1.push(c.case.clone());
         }
     }
@@ -855,7 +905,7 @@ pub fn plan_parallel(
                     cs.join(", ")
                 ));
             } else {
-                parts.push(format!("obsolete rows: {} (the rule, permission or branch is gone): remove or update them with write_test remove", cs.join(", ")));
+                parts.push(format!("obsolete rows: {} (the route parameter, sign-in or validation rule they test is gone): remove or update them with write_test remove", cs.join(", ")));
             }
         }
         if let Some(cs) = plan.missing.get(target) {
@@ -1386,9 +1436,11 @@ pub(crate) mod tests {
                 "{covered} is covered but planned: {missing:?}"
             );
         }
-        for want in ["forbidden", "not_found", "invalid:email:email", "boundary:qty:min"] {
+        for want in ["forbidden", "invalid:email:email", "boundary:qty:min"] {
             assert!(missing.contains(&want), "{want} not in {missing:?}");
         }
+        // {order} is only compared with a string in the action, never looked up: no not_found case
+        assert!(!missing.contains(&"not_found"), "{missing:?}");
     }
 
     #[test]
@@ -1554,6 +1606,55 @@ pub(crate) mod tests {
             .find(|i| i.id == "tests:GET api/gone")
             .unwrap_or_else(|| panic!("{:?}", ids(&p)));
         assert!(gone.reason.contains("route no longer exists"), "{}", gone.reason);
+    }
+
+    #[test]
+    fn extra_rows_are_not_obsolete() {
+        let (_d, cfg) = project();
+        doctest_rows(
+            &cfg,
+            "POST api/orders/{order}",
+            &[
+                "returns:new_value",
+                "state:other_project",
+                "filter:search",
+                "throws:Gone",
+                "invalid:email:email",
+            ],
+        );
+        let mut st = State::default();
+        let p = plan(&cfg, &mut api(), &mut st, &Scope::All).unwrap();
+        let item = p.items.iter().find(|i| i.id == "tests:POST api/orders/{order}");
+        assert!(item.is_none_or(|i| !i.reason.contains("obsolete")), "{item:?}");
+    }
+
+    #[test]
+    fn package_routes_and_excluded_targets_are_not_test_work() {
+        assert!(package_action(
+            "Laravel\\Passport\\Http\\Controllers\\AuthorizedAccessTokenController@destroy",
+            &["App\\".to_string()]
+        ));
+        assert!(!package_action(
+            "App\\Http\\Controllers\\OrderController@store",
+            &["App\\".to_string()]
+        ));
+        assert!(!package_action("Laravel\\Passport\\X@y", &[]));
+        let (_d, mut cfg) = project();
+        cfg.tests.exclude = vec!["api/orders/*".into()];
+        let mut st = State::default();
+        st.untestable
+            .insert("DELETE api/everything".into(), "calls exit()".into());
+        assert!(test_excluded(&cfg, &st, "POST api/orders/{order}"));
+        assert!(test_excluded(&cfg, &st, "DELETE api/everything"));
+        assert!(!test_excluded(&cfg, &st, "GET api/ping"));
+        let p = plan(&cfg, &mut api(), &mut st, &Scope::All).unwrap();
+        assert!(
+            !p.items
+                .iter()
+                .any(|i| i.id == "tests:POST api/orders/{order}" || i.id == "tests:DELETE api/everything"),
+            "{:?}",
+            ids(&p)
+        );
     }
 
     #[test]

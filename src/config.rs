@@ -127,6 +127,9 @@ pub struct TestConfig {
     pub run: String,
     pub unit_dir: PathBuf,
     pub feature_dir: PathBuf,
+    /// Test targets never handed out (`GET oauth/*`, `App\\Console\\Commands\\Sync::*`): code that cannot run
+    /// under PHPUnit (exit(), dd(), real network) or routes of a package.
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +220,8 @@ struct RawTests {
     run: Option<String>,
     unit_dir: Option<String>,
     feature_dir: Option<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -335,6 +340,7 @@ impl Config {
                 run,
                 unit_dir: PathBuf::from(raw.tests.unit_dir.unwrap_or_else(|| "tests/Unit".into())),
                 feature_dir: PathBuf::from(raw.tests.feature_dir.unwrap_or_else(|| "tests/Feature".into())),
+                exclude: raw.tests.exclude,
             },
             guide: GuideConfig {
                 modules_from: raw.guide.modules_from.map(|m| root.join(m)),
