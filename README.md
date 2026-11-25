@@ -80,6 +80,8 @@ allow = ["POST /api/*/search"]        # requests that only read, let through in 
 [tests]
 run = "docker exec shop-backend sh -c 'cd /var/www/api && php artisan test {filter}'"   # {filter}: the test file and --filter, quoted to fit
 # exclude = ["oauth/*", "App\\Console\\Commands\\Sync::*"]  # targets PHPUnit cannot test (also: write_test skip)
+# parallel = 3                        # test runs at once; the run line then needs {slot} for a database per run:
+#                                     # run = "docker exec -e DB_DATABASE=shop_test_{slot} shop-backend php artisan test {filter}"
 
 [guide]
 modules_from = "../shop-web/src/config/adminMenu.ts"   # menu file: chapters and menu paths
@@ -203,11 +205,16 @@ The MCP tools behind these commands:
 | `facts` | Everything for one work item: real labels, texts, endpoints, rules, messages, menu path, skeleton |
 | `write_doc` | Store a guide/translation/system section; refused if it names UI the page lacks |
 | `shoot` | Take or retake a screenshot from a spec; returns the image |
-| `cases`, `write_test` | Expected cases and who covers them; add data-provider rows, run them (only that test file), keep the rows whose own data set passed and report the others with PHPUnit's message; `skip: "why"` marks a target PHPUnit cannot test |
+| `cases`, `write_test` | Expected cases and who covers them; add data-provider rows, run them (only that test file), keep the rows whose own data set passed and report the others with PHPUnit's message; `tests: [...]` writes several targets with one test run; `skip: "why"` marks a target PHPUnit cannot test |
 | `run_tests`, `check`, `build` | Run doctest's tests; check everything (CI); rebuild the HTML |
 | `issues` | Code to fix, as points |
 | `verify_changes` | Validate the current change: pass/fail with points |
 | `finish` | Record the commits so the next `changes` scope starts here |
+
+codemap's answers are kept between calls (in memory, and under `~/.doctest/cache/` for the next doctest) until git
+sees the code change, so `facts`, `write_doc`, `cases` and `write_test` answer in about a second after the first call.
+Call the tools directly rather than through scripts that start a new doctest per call; write long guides to a file and
+send `write_doc` its `markdown_file`; `facts` takes `brief: true` for a shorter reply.
 
 `status`, `plan` and `claim` keep each page's facts between runs (under `~/.doctest/cache/`) and read again only
 the pages whose code changed: on a 900-screen app a repeat `status` takes about 20 seconds instead of 3 minutes.

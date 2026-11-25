@@ -23,7 +23,7 @@ use crate::work::{self, Scope};
 
 const SHOOT_HELP: &str = "Take (or retake) a screenshot. Send a spec {id, page, path, params, user, lang, steps, crop, mask, allow_saves}, or an id alone to retake its stored spec. Returns the path to reference (and the image itself only with show: true). A shot stops after 90 s, a blank image is refused, and alert, confirm and leave-page dialogs are answered (confirm with Cancel).\nsteps (in order): {\"fill\": \"css\", \"value\": \"text\"} clears the field then types; {\"select\": \"css\", \"value\": \"v\"}; {\"click\": \"css\"}; {\"wait\": \"css\"} waits for an element; {\"wait_text\": \"Saved\"} waits for text; {\"scroll\": \"css\" | \"top\" | \"bottom\"}; {\"goto\": \"/path\"}.\nmask (on top of [screenshots] mask; inside shadow roots too, re-applied when the page re-renders): {\"selector\": \"css\", \"text\": \"Demo\"} replaces text or input values; {\"regex\": \"[A-Z]{2}-\\\\d+\", \"text\": \"AB-1\"} a JavaScript regex ((?i) at the start ignores case); {\"hide\": \"css\"} hides elements. The reply names masks that matched nothing.\ncrop: a CSS selector to capture just that element (scrolled into view first).\nSafe mode (on unless [screenshots] safe = false): the browser refuses POST/PUT/PATCH/DELETE while shooting, so steps cannot save or delete; the reply lists what it blocked. Set allow_saves only to show a real save result, on test data; retaking that spec saves again.";
 
-pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shots:<page>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides, text first: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides) WITHOUT screenshots: put a line <!-- shot: what it shows --> where each screenshot of facts.screenshot_plan belongs, and do not call shoot for guide items. Then translations (translation items; same structure, labels in that language, the same <!-- shot --> lines). When the guides are written, call shoot_pages once: doctest takes every page's opening screenshot itself, in parallel, and puts it in each language's guide. Last come shots:<page> items, for the action screenshots only: shoot a spec (path, params for :id, steps, crop, user, lang) and replace the matching <!-- shot --> line with ![alt](guide/img/<lang>/<id>.webp) in the primary guide and in every translation (translations reuse the primary language's images unless facts says otherwise). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. doctest writes the data provider itself (method_php is the test method alone). Failing rows are removed and reported with PHPUnit's message; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer. A target PHPUnit cannot test (exit(), dd(), real network, a package's route): write_test with skip: \"why\".\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Test runs are serialized by doctest. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
+pub const MCP_INSTRUCTIONS: &str = "Every doctest reply ends with a summary: how long the step took, what it found (errors, failures, counts) and what to do next — follow its next line.\n\ndoctest keeps a Laravel + Vue project's user guide (per page, per language), its system document (static HTML in document/, starting at index.html with server setup from scratch) and its PHPUnit tests current. You write; doctest finds what is missing or stale, gives you the facts, checks what you write, takes screenshots, runs tests and builds the HTML.\n\nWorkflow:\n1. status (scope changes = since the last finish; branch = what this branch changed since it left main/master, or base; all = whole system) and plan list work items: guide:<lang>:<page>, translation:<lang>:<page>, process:<lang>:<slug>, shots:<page>, shot:<id>, doc:<section>, tests:<target>.\n2. For each item call facts first and write only from them: the page's real labels, literal texts, endpoints, rules, messages, menu path. Never invent a field, button or message: write_doc refuses **bold** UI names the page does not have.\n3. Guides, text first: write the primary language first (page template: What this page is for, Before you start, one section per action from facts.actions (Add, Edit, Delete, Approve…) with numbered steps and what the user should see afterwards — the success message, the changed list, the validation errors — Fields table, Messages you may see, Related guides) WITHOUT screenshots: put a line <!-- shot: what it shows --> where each screenshot of facts.screenshot_plan belongs, and do not call shoot for guide items. Then translations (translation items; same structure, labels in that language, the same <!-- shot --> lines). When the guides are written, call shoot_pages once: doctest takes every page's opening screenshot itself, in parallel, and puts it in each language's guide. Last come shots:<page> items, for the action screenshots only: shoot a spec (path, params for :id, steps, crop, user, lang) and replace the matching <!-- shot --> line with ![alt](guide/img/<lang>/<id>.webp) in the primary guide and in every translation (translations reuse the primary language's images unless facts says otherwise). Mask real data with [screenshots] mask.\n4. Portals: the app's sign-in areas (admin, selfcare, a Filament panel, a member portal…), found from its login pages; each has its own guide and its own sign-in. facts gives the page's source_path inside its portal; screenshots use the portal's session (public pages none); when shoot says a portal is not signed in, call login with that portal. The guide folder is published alone at the publish path, so guide pages never link to the start page or system document, and images live in guide/img/<lang>/.\n5. Server setup (doc:index): from facts only (versions, extensions, env keys, services, deploy files) for a real server, not localhost; mark any step the repo does not back with a line <!-- unverified --> before it.\n6. Tests: cases lists the expected cases of a target and which test covers each. write_test adds ONE parameterised test method per target with a data provider: rows keyed by case (ok, guest, forbidden, not_found, invalid:<field>:<rule>, boundary:<field>:min|max, filter:<param>, state:<name>, throws:<Exception>, returns:<name>), covering positive and negative cases; later calls add rows (leave method_php out). A case already covered is refused. doctest writes the data provider itself (method_php is the test method alone). Failing rows are removed and reported with PHPUnit's message; after reading the code, if the code is wrong, send the row again with bug set: it is kept in group doctest-bug for the developer. A target PHPUnit cannot test (exit(), dd(), real network, a package's route): write_test with skip: \"why\".\nIf doctest itself gives a wrong or confusing answer, call report_problem; failures inside doctest are recorded automatically. A bug in the app you are documenting (a page that errors, a form that cannot save) is not a doctest problem: tell the person, and in tests keep the failing row with bug set. Either way tell the person the report id and that `doctest reports --send <id>` files it as a GitHub issue. Run doctor when something about the setup fails.\n7. issues lists code to fix as points (file:line, reason, fix): N+1, missing indexes, unoptimised queries and Vue code, failing tests. verify_changes validates the current change (affected tests, doctest tests, problems on changed lines, what is left). Tell the user about the points.\n8. Parallel work: to go faster, start several workers (e.g. 4 subagents); each calls claim with its own worker name to get its own items, works them, and claims again until none are left. Call doctest's tools directly, never through scripts that start a new doctest per call: one doctest keeps codemap answers and page facts between calls, a new one starts cold (and a new Chrome per screenshot). Long guides can be written to a file and sent with write_doc markdown_file; facts brief: true gives a shorter reply. Tests: send several targets in one write_test call (tests: [...]): they share one test run, which is most of a write_test's time. Test runs go one at a time unless [tests] parallel gives each its own database. Long calls report progress (percent).\n9. check, then finish (records the commits so the next changes scope starts here).";
 
 /// Makes a codemap client for a project; the number is the parallel worker (0 = the main client).
 pub type Factory = std::sync::Arc<dyn Fn(&Config, usize) -> Box<dyn CodemapApi + Send> + Send + Sync>;
@@ -99,15 +99,15 @@ pub fn tools() -> Value {
         ),
         tool(
             "facts",
-            "Everything needed for one work item: page labels/literals/endpoints/rules/messages/menu path, current and primary text, a skeleton, the source path; server facts for doc:index; cases for tests:<target>.",
-            json!({"item": {"type": "string"}}),
+            "Everything needed for one work item: page labels/literals/endpoints/rules/messages/menu path, current and primary text, a skeleton, the source path; server facts for doc:index; cases for tests:<target>. brief: true leaves out the current guide text (read it at source_path), component lists and long notes.",
+            json!({"item": {"type": "string"}, "brief": {"type": "boolean"}}),
             &["item"]
         ),
         tool(
             "write_doc",
-            "Store a guide, translation, process guide or system section (Markdown with a --- front matter header). Refused with the problems when it names UI the page lacks or links break; else saved and the HTML rebuilt.",
-            json!({"item": {"type": "string"}, "markdown": {"type": "string"}}),
-            &["item", "markdown"]
+            "Store a guide, translation, process guide or system section (Markdown with a --- front matter header). Refused with the problems when it names UI the page lacks or links break; else saved and the HTML rebuilt. markdown_file: a file holding the Markdown instead of markdown (write it with your file tool, then send its path).",
+            json!({"item": {"type": "string"}, "markdown": {"type": "string"}, "markdown_file": {"type": "string", "description": "path of a file holding the Markdown, instead of markdown"}}),
+            &["item"]
         ),
         tool(
             "shoot_pages",
@@ -135,9 +135,9 @@ pub fn tools() -> Value {
         ),
         tool(
             "write_test",
-            "Add data-provider rows (and the parameterised method the first time) for a target, run them (only its test file), keep the rows whose own data set passed, remove failing or not-run ones with PHPUnit's message (unless bug is set). doctest writes the data provider cases_<method> itself: method_php is the test method alone, without a DataProvider attribute or provider method. A row sent again with bug added or taken away moves between the main and bug providers. A target with only bug rows keeps its method as a helper of <method>_known_bugs. skip: \"why\" marks a target PHPUnit cannot test (exit(), dd(), real network, a package's route) so status and claim stop listing it; unskip: true undoes it.",
-            json!({"target": {"type": "string"}, "skip": {"type": "string"}, "unskip": {"type": "boolean"}, "method": {"type": "string"}, "method_php": {"type": "string"}, "rows": {"type": "array", "items": {"type": "object", "properties": {"case": {"type": "string"}, "args_php": {"type": "string"}, "bug": {"type": "string"}}, "required": ["case", "args_php"]}}, "remove": {"type": "array", "items": {"type": "string"}, "description": "case keys of obsolete rows to delete"}, "replace": {"type": "boolean", "description": "replace the existing doctest method with method_php (fix a broken body)"}}),
-            &["target"]
+            "Add data-provider rows (and the parameterised method the first time) for a target, run them (only its test file), keep the rows whose own data set passed, remove failing or not-run ones with PHPUnit's message (unless bug is set). doctest writes the data provider cases_<method> itself: method_php is the test method alone, without a DataProvider attribute or provider method. A row sent again with bug added or taken away moves between the main and bug providers. A target with only bug rows keeps its method as a helper of <method>_known_bugs. Several targets at once: tests: [{target, method, method_php, rows, ...}, ...] writes them all and runs them in ONE test run (much faster than one call each). skip: \"why\" marks a target PHPUnit cannot test (exit(), dd(), real network, a package's route) so status and claim stop listing it; unskip: true undoes it.",
+            json!({"tests": {"type": "array", "items": {"type": "object"}, "description": "several targets in one call and one test run; each item takes the same fields as a single call"}, "target": {"type": "string"}, "skip": {"type": "string"}, "unskip": {"type": "boolean"}, "method": {"type": "string"}, "method_php": {"type": "string"}, "rows": {"type": "array", "items": {"type": "object", "properties": {"case": {"type": "string"}, "args_php": {"type": "string"}, "bug": {"type": "string"}}, "required": ["case", "args_php"]}}, "remove": {"type": "array", "items": {"type": "string"}, "description": "case keys of obsolete rows to delete"}, "replace": {"type": "boolean", "description": "replace the existing doctest method with method_php (fix a broken body)"}}),
+            &[]
         ),
         tool(
             "run_tests",
@@ -488,12 +488,23 @@ impl Server {
                     &json!({"worker": worker, "items": got.iter().map(|(id, r)| json!({"id": id, "reason": r})).collect::<Vec<_>>(), "queued": left, "note": note}),
                 ))
             }
-            "facts" => text(facts(p, s(args, "item").ok_or("item is required")?)?),
-            "write_doc" => text(write_doc(
-                p,
-                s(args, "item").ok_or("item is required")?,
-                s(args, "markdown").ok_or("markdown is required")?,
-            )?),
+            "facts" => {
+                let full = facts(p, s(args, "item").ok_or("item is required")?)?;
+                if args.get("brief").and_then(Value::as_bool).unwrap_or(false) {
+                    text(brief_facts(&full))
+                } else {
+                    text(full)
+                }
+            }
+            "write_doc" => {
+                // the guide as text, or from a file the worker wrote (no need to send long markdown in the call)
+                let markdown = match (s(args, "markdown"), s(args, "markdown_file")) {
+                    (Some(m), _) => m.to_string(),
+                    (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| format!("markdown_file {f}: {e}"))?,
+                    (None, None) => return Err("markdown (or markdown_file) is required".into()),
+                };
+                text(write_doc(p, s(args, "item").ok_or("item is required")?, &markdown)?)
+            }
             "shoot" => shoot(p, args),
             "shoot_pages" => text(shoot_pages(p, args, progress)?),
             "retake" => text(retake(p, args, progress)?),
@@ -2265,6 +2276,30 @@ fn shoot(p: &mut Project, args: &Value) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// facts without what a worker can read itself or rarely needs: the current guide text (its length and path stay),
+/// component lists and long notes.
+fn brief_facts(full: &str) -> String {
+    let end = full.rfind('}').map(|i| i + 1).unwrap_or(full.len());
+    let Ok(mut v) = serde_json::from_str::<Value>(&full[..end]) else {
+        return full.to_string();
+    };
+    if let Some(o) = v.as_object_mut() {
+        if let Some(cur) = o.remove("current_text") {
+            let n = cur.as_str().map(str::len).unwrap_or(0);
+            if n > 0 {
+                o.insert(
+                    "current_text".into(),
+                    json!(format!(
+                        "({n} characters; read the guide at source_path, or call facts without brief)"
+                    )),
+                );
+            }
+        }
+        o.retain(|k, _| !k.ends_with("_note") && k != "components" && k != "screenshot_plan_without_data");
+    }
+    format!("{}{}", pretty(&v), &full[end..])
+}
+
 /// The endpoint or method behind a target, its action (for the test file) and its expected cases.
 fn target_info(p: &mut Project, target: &str) -> Result<(String, Vec<cases::Case>, Value), String> {
     let cfg = p.cfg.clone();
@@ -2341,7 +2376,69 @@ fn endpoint_for_ledger(target: &str) -> Vec<crate::pages::Endpoint> {
     }
 }
 
+/// One write_test item, checked and ready to write: its rows, its test file and class.
+struct PreparedTest {
+    target: String,
+    t: NewTests,
+    replace: bool,
+    replace_php: Option<String>,
+    removed_note: String,
+    file: PathBuf,
+    class: String,
+    ns: String,
+    rel: String,
+}
+
+enum Prepared {
+    /// Nothing to run (skip, unskip, a removal only): the reply.
+    Done(String),
+    Ready(Box<PreparedTest>),
+}
+
 fn write_test(p: &mut Project, args: &Value) -> Result<String, String> {
+    let cfg = p.cfg.clone();
+    // several targets at once: one test run for all of them
+    if let Some(list) = args.get("tests").and_then(Value::as_array) {
+        if list.is_empty() {
+            return Err("tests is empty".into());
+        }
+        let mut replies: Vec<(usize, String, Result<String, String>)> = Vec::new();
+        let mut ready: Vec<(usize, PreparedTest)> = Vec::new();
+        for (i, item) in list.iter().enumerate() {
+            let target = s(item, "target").unwrap_or("?").to_string();
+            match prepare_test(p, item) {
+                Ok(Prepared::Done(m)) => replies.push((i, target, Ok(m))),
+                Ok(Prepared::Ready(r)) => ready.push((i, *r)),
+                Err(e) => replies.push((i, target, Err(e))),
+            }
+        }
+        replies.extend(write_prepared(&cfg, ready));
+        replies.sort_by_key(|(i, _, _)| *i);
+        let failed = replies.iter().filter(|r| r.2.is_err()).count();
+        let mut out = format!(
+            "{} target(s): {} written, {failed} not written",
+            replies.len(),
+            replies.len() - failed
+        );
+        for (_, target, r) in &replies {
+            match r {
+                Ok(m) => out += &format!("\n\n## {target}\n{m}"),
+                Err(e) => out += &format!("\n\n## {target}\nnot written: {e}"),
+            }
+        }
+        return if failed == replies.len() { Err(out) } else { Ok(out) };
+    }
+    match prepare_test(p, args)? {
+        Prepared::Done(m) => Ok(m),
+        Prepared::Ready(r) => write_prepared(&cfg, vec![(0, *r)])
+            .pop()
+            .map(|(_, _, r)| r)
+            .unwrap_or_else(|| Err("nothing was written".into())),
+    }
+}
+
+/// Checks one write_test item and does what needs no test run (skip, unskip, removing rows).
+fn prepare_test(p: &mut Project, args: &Value) -> Result<Prepared, String> {
     let target = s(args, "target").ok_or("target is required")?.to_string();
     let cfg = p.cfg.clone();
     // a target PHPUnit cannot test: it leaves the queue for good
@@ -2354,16 +2451,16 @@ fn write_test(p: &mut Project, args: &Value) -> Result<String, String> {
             st.untestable.insert(target.clone(), why.clone());
             st.done(&format!("tests:{target}"));
         })?;
-        return Ok(format!(
+        return Ok(Prepared::Done(format!(
             "{target} is marked as not testable ({why}); status and claim no longer list it (unskip: true undoes it)"
-        ));
+        )));
     }
     if args.get("unskip").and_then(Value::as_bool).unwrap_or(false) {
         let was = State::update(&cfg, |st| st.untestable.remove(&target))?;
-        return Ok(match was {
+        return Ok(Prepared::Done(match was {
             Some(_) => format!("{target} is testable again; the next status lists its missing cases"),
             None => format!("{target} was not marked as not testable"),
-        });
+        }));
     }
     let t = NewTests {
         method: s(args, "method").ok_or("method is required")?.to_string(),
@@ -2390,7 +2487,6 @@ fn write_test(p: &mut Project, args: &Value) -> Result<String, String> {
             .ok_or_else(|| format!("no doctest rows of {} for {target}", t.method))?;
         {
             let _file_lock = testwrite::file_lock(&file)?;
-            let _lock = State::test_lock(&cfg)?;
             testwrite::remove_rows_unlocked(&file, &t.method, &remove)?;
             let still = std::fs::read_to_string(&file)
                 .ok()
@@ -2411,7 +2507,11 @@ fn write_test(p: &mut Project, args: &Value) -> Result<String, String> {
                 ));
             }
             State::update(&cfg, |st| st.done(&format!("tests:{target}")))?;
-            return Ok(format!("removed rows {} from {}", remove.join(", "), t.method));
+            return Ok(Prepared::Done(format!(
+                "removed rows {} from {}",
+                remove.join(", "),
+                t.method
+            )));
         }
     }
     let (action, _, _) = target_info(p, &target)?;
@@ -2432,158 +2532,331 @@ fn write_test(p: &mut Project, args: &Value) -> Result<String, String> {
     if !covered.is_empty() {
         return Err(format!("already covered, not written: {}", covered.join(", ")));
     }
-    // the whole edit → run → keep/roll back sequence holds the file and the test runner: no other worker's run
-    // loads this file half-edited, and a rollback never drops another worker's edit
-    let _file_lock = testwrite::file_lock(&file)?;
-    let _test_lock = State::test_lock(&cfg)?;
-    let before = std::fs::read_to_string(&file).ok();
-    let restore = |why: String| -> String {
-        let _ = match &before {
-            Some(text) => testwrite::write_atomic(&file, text),
-            None => std::fs::remove_file(&file).map_err(|e| e.to_string()),
-        };
-        format!("the test file was rolled back to how it was: {why}")
-    };
     let mut t = t;
-    if replace {
-        let php = t.method_php.take().ok_or("replace needs method_php")?;
-        testwrite::replace_method_unlocked(&file, &t.method, &php).map_err(restore)?;
-    }
-    if !t.rows.is_empty() {
-        testwrite::insert_unlocked(&file, &class, &ns, &target, &t).map_err(|e| {
-            if replace || before.as_deref() != std::fs::read_to_string(&file).ok().as_deref() {
-                restore(e)
-            } else {
-                e
-            }
-        })?;
-    }
+    let replace_php = if replace {
+        Some(t.method_php.take().ok_or("replace needs method_php")?)
+    } else {
+        None
+    };
     let rel = file
         .strip_prefix(&cfg.backend)
         .unwrap_or(&file)
         .to_string_lossy()
         .into_owned();
-    let bugs_method = format!("{}_known_bugs", t.method);
-    let text_now = std::fs::read_to_string(&file).unwrap_or_default();
-    let main_rows: Vec<String> = testwrite::provider_rows(&text_now, &format!("cases_{}", t.method))
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
-    let bug_rows: Vec<String> = testwrite::provider_rows(&text_now, &format!("bugs_{}", t.method))
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
-    let mut methods = Vec::new();
-    if !main_rows.is_empty() {
-        methods.push(t.method.clone());
-    }
-    if !bug_rows.is_empty() {
-        methods.push(bugs_method.clone());
-    }
-    if methods.is_empty() {
-        return Err(restore(format!("{} has no rows to run", t.method)));
-    }
-    let res = match testwrite::run_in(&cfg, Some(&rel), &testwrite::filter_for(&class, &methods)) {
-        Ok(r) => r,
-        Err(e) => return Err(restore(e)),
-    };
-    // every row is judged by its own data set: passed, failed, or not run at all
-    let status = |case: &str| -> Option<bool> {
-        if bug_rows.iter().any(|b| b == case) {
-            res.row(&bugs_method, case)
-        } else {
-            res.row(&t.method, case)
+    Ok(Prepared::Ready(Box::new(PreparedTest {
+        target,
+        t,
+        replace,
+        replace_php,
+        removed_note,
+        file,
+        class,
+        ns,
+        rel,
+    })))
+}
+
+/// Writes prepared items, runs them (one PHPUnit run per group of items whose method names differ, only their test
+/// files), keeps the rows whose own data set passed and takes the others out again. (index, target, reply).
+fn write_prepared(cfg: &Config, items: Vec<(usize, PreparedTest)>) -> Vec<(usize, String, Result<String, String>)> {
+    // PHPUnit's output names a test by its method only: items sharing a method name go in separate runs
+    let mut runs: Vec<Vec<(usize, PreparedTest)>> = Vec::new();
+    for item in items {
+        let m = item.1.t.method.clone();
+        match runs.iter_mut().find(|r| r.iter().all(|(_, x)| x.t.method != m)) {
+            Some(r) => r.push(item),
+            None => runs.push(vec![item]),
         }
-    };
-    let ran_any = main_rows.iter().chain(&bug_rows).any(|c| status(c).is_some());
-    if !ran_any {
-        return Err(restore(format!(
-            "no row of {} ran (a data provider that cannot be built, e.g. row values that need the framework such as __() or factories, or a file that does not parse):\n{}",
-            t.method,
-            testwrite::tail(&res.output, 30)
-        )));
     }
-    let detail = |case: &str, method: &str| -> String {
-        match status(case) {
-            None => format!(
-                "did not run (its data set was not in PHPUnit's output):\n{}",
-                testwrite::tail(&res.output, 12)
-            ),
-            _ => {
-                let (at, text) = res.failure(method, case);
-                let text = if text.trim().is_empty() {
-                    testwrite::tail(&res.output, 15)
-                } else {
-                    text.lines().take(12).collect::<Vec<_>>().join("\n")
-                };
-                format!("{}: {}", at.as_deref().unwrap_or("no file:line printed"), text)
+    let mut out = Vec::new();
+    for run in runs {
+        out.extend(write_run(cfg, run));
+    }
+    out
+}
+
+fn write_run(cfg: &Config, run: Vec<(usize, PreparedTest)>) -> Vec<(usize, String, Result<String, String>)> {
+    let mut out: Vec<(usize, String, Result<String, String>)> = Vec::new();
+    // the whole edit → run → keep/take out sequence holds the files and a test runner slot: no other worker's run
+    // loads these files half-edited, and taking rows out never drops another worker's edit
+    let mut files: Vec<PathBuf> = run.iter().map(|(_, x)| x.file.clone()).collect();
+    files.sort();
+    files.dedup();
+    let mut locks = Vec::new();
+    for f in &files {
+        match testwrite::file_lock(f) {
+            Ok(l) => locks.push(l),
+            Err(e) => {
+                return run.into_iter().map(|(i, x)| (i, x.target, Err(e.clone()))).collect();
             }
         }
+    }
+    let (_slot_lock, slot) = match State::test_slot(cfg) {
+        Ok(s) => s,
+        Err(e) => return run.into_iter().map(|(i, x)| (i, x.target, Err(e.clone()))).collect(),
     };
-    let new_cases: Vec<&str> = t
-        .rows
+    let snapshot: HashMap<PathBuf, Option<String>> = files
         .iter()
-        .filter(|r| r.bug.is_none())
-        .map(|r| r.case.as_str())
+        .map(|f| (f.clone(), std::fs::read_to_string(f).ok()))
         .collect();
-    let old_failing: Vec<&String> = main_rows
-        .iter()
-        .filter(|c| !new_cases.contains(&c.as_str()) && status(c) != Some(true))
-        .collect();
-    if replace && !old_failing.is_empty() {
-        let lines: Vec<String> = old_failing
+    let put_back = |file: &PathBuf, text: &Option<String>| {
+        let _ = match text {
+            Some(t) => testwrite::write_atomic(file, t),
+            None => std::fs::remove_file(file).map_err(|e| e.to_string()),
+        };
+    };
+    // edit every item; one that cannot be written leaves its file as it was before it
+    struct Written {
+        idx: usize,
+        x: PreparedTest,
+        before: Option<String>,
+        main_rows: Vec<String>,
+        bug_rows: Vec<String>,
+    }
+    let mut written: Vec<Written> = Vec::new();
+    for (idx, mut x) in run {
+        let before = std::fs::read_to_string(&x.file).ok();
+        let edit = || -> Result<(), String> {
+            if let Some(php) = x.replace_php.as_deref() {
+                testwrite::replace_method_unlocked(&x.file, &x.t.method, php)?;
+            }
+            if !x.t.rows.is_empty() {
+                testwrite::insert_unlocked(&x.file, &x.class, &x.ns, &x.target, &x.t)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = edit() {
+            let changed = before != std::fs::read_to_string(&x.file).ok();
+            if changed {
+                put_back(&x.file, &before);
+            }
+            out.push((
+                idx,
+                x.target.clone(),
+                Err(if changed || x.replace {
+                    format!("the test file was rolled back to how it was: {e}")
+                } else {
+                    e
+                }),
+            ));
+            continue;
+        }
+        let text = std::fs::read_to_string(&x.file).unwrap_or_default();
+        let rows = |p: String| -> Vec<String> {
+            testwrite::provider_rows(&text, &p)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        let main_rows = rows(format!("cases_{}", x.t.method));
+        let bug_rows = rows(format!("bugs_{}", x.t.method));
+        if main_rows.is_empty() && bug_rows.is_empty() {
+            put_back(&x.file, &before);
+            out.push((idx, x.target.clone(), Err(format!("{} has no rows to run", x.t.method))));
+            continue;
+        }
+        x.replace_php = None;
+        written.push(Written {
+            idx,
+            x,
+            before,
+            main_rows,
+            bug_rows,
+        });
+    }
+    if written.is_empty() {
+        return out;
+    }
+    let mut by_class: Vec<(String, Vec<String>)> = Vec::new();
+    for w in &written {
+        let mut ms = Vec::new();
+        if !w.main_rows.is_empty() {
+            ms.push(w.x.t.method.clone());
+        }
+        if !w.bug_rows.is_empty() {
+            ms.push(format!("{}_known_bugs", w.x.t.method));
+        }
+        match by_class.iter_mut().find(|(c, _)| *c == w.x.class) {
+            Some((_, v)) => v.extend(ms),
+            None => by_class.push((w.x.class.clone(), ms)),
+        }
+    }
+    let mut rels: Vec<String> = written.iter().map(|w| w.x.rel.clone()).collect();
+    rels.sort();
+    rels.dedup();
+    let res = match testwrite::run_in(cfg, &rels, &testwrite::filter_for_many(&by_class), slot) {
+        Ok(r) => r,
+        Err(e) => {
+            for (f, text) in &snapshot {
+                put_back(f, text);
+            }
+            for w in written {
+                out.push((
+                    w.idx,
+                    w.x.target,
+                    Err(format!("the test file was rolled back to how it was: {e}")),
+                ));
+            }
+            return out;
+        }
+    };
+    let shared: HashMap<PathBuf, usize> = written.iter().fold(HashMap::new(), |mut m, w| {
+        *m.entry(w.x.file.clone()).or_default() += 1;
+        m
+    });
+    let mut done_targets: Vec<(String, String)> = Vec::new();
+    for w in written {
+        let Written {
+            idx,
+            x,
+            before,
+            main_rows,
+            bug_rows,
+        } = w;
+        let t = &x.t;
+        let bugs_method = format!("{}_known_bugs", t.method);
+        // takes this item out again: its file as it was when it is the only item there, else its own rows (and,
+        // for a replaced body, the old body)
+        let undo = || {
+            if shared.get(&x.file).copied().unwrap_or(0) <= 1 {
+                put_back(&x.file, &before);
+                return;
+            }
+            let cases: Vec<String> = t.rows.iter().map(|r| r.case.clone()).collect();
+            let _ = testwrite::remove_rows_unlocked(&x.file, &t.method, &cases);
+            if x.replace
+                && let Some(old) = before.as_deref()
+                && let Some((s0, e0)) = testwrite::function_span(old, &t.method)
+                && let Ok(now) = std::fs::read_to_string(&x.file)
+                && let Some((s1, e1)) = testwrite::function_span(&now, &t.method)
+            {
+                let mut fixed = now.clone();
+                fixed.replace_range(s1..e1, &old[s0..e0]);
+                let _ = testwrite::write_atomic(&x.file, &fixed);
+            }
+        };
+        // every row is judged by its own data set: passed, failed, or not run at all
+        let status = |case: &str| -> Option<bool> {
+            if bug_rows.iter().any(|b| b == case) {
+                res.row(&bugs_method, case)
+            } else {
+                res.row(&t.method, case)
+            }
+        };
+        let ran_any = main_rows.iter().chain(&bug_rows).any(|c| status(c).is_some());
+        if !ran_any {
+            undo();
+            out.push((
+                idx,
+                x.target.clone(),
+                Err(format!(
+                    "the test file was rolled back to how it was: no row of {} ran (a data provider that cannot be built, e.g. row values that need the framework such as __() or factories, or a file that does not parse):\n{}",
+                    t.method,
+                    testwrite::tail(&res.output, 30)
+                )),
+            ));
+            continue;
+        }
+        let detail = |case: &str, method: &str| -> String {
+            match status(case) {
+                None => format!(
+                    "did not run (its data set was not in PHPUnit's output):\n{}",
+                    testwrite::tail(&res.output, 12)
+                ),
+                _ => {
+                    let (at, text) = res.failure(method, case);
+                    let text = if text.trim().is_empty() {
+                        testwrite::tail(&res.output, 15)
+                    } else {
+                        text.lines().take(12).collect::<Vec<_>>().join("\n")
+                    };
+                    format!("{}: {}", at.as_deref().unwrap_or("no file:line printed"), text)
+                }
+            }
+        };
+        let new_cases: Vec<&str> = t
+            .rows
             .iter()
-            .map(|c| format!("- {c}: {}", detail(c, &t.method)))
+            .filter(|r| r.bug.is_none())
+            .map(|r| r.case.as_str())
             .collect();
-        return Err(restore(format!(
-            "the new method_php fails rows {} — fix it and send it again:\n{}",
-            old_failing.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
-            lines.join("\n")
-        )));
-    }
-    let to_remove: Vec<String> = new_cases
-        .iter()
-        .filter(|c| status(c) != Some(true))
-        .map(|c| c.to_string())
-        .collect();
-    let mut reasons = Vec::new();
-    for c in &to_remove {
-        reasons.push(format!("\n- {c} failed and was removed ({})", detail(c, &t.method)));
-    }
-    if !to_remove.is_empty() {
-        testwrite::remove_rows_unlocked(&file, &t.method, &to_remove).map_err(restore)?;
-    }
-    let passing_bugs: Vec<&String> = bug_rows.iter().filter(|c| status(c) == Some(true)).collect();
-    let method = t.method.clone();
-    State::update(&cfg, |st| {
-        st.failing.retain(|f| !testwrite::same_method(f, &method));
-        st.done(&format!("tests:{target}"));
-    })?;
-    let mut out = format!(
-        "{rel}: {} row(s) written{}{removed_note}",
-        t.rows.len() - to_remove.len(),
-        if replace { ", method replaced" } else { "" }
-    );
-    for r in &reasons {
-        out += r;
-    }
-    if !old_failing.is_empty() {
-        out += &format!(
-            "\n- rows already in {} that fail now (not removed; fix with replace or remove): {}",
-            t.method,
-            old_failing.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+        let old_failing: Vec<&String> = main_rows
+            .iter()
+            .filter(|c| !new_cases.contains(&c.as_str()) && status(c) != Some(true))
+            .collect();
+        if x.replace && !old_failing.is_empty() {
+            let lines: Vec<String> = old_failing
+                .iter()
+                .map(|c| format!("- {c}: {}", detail(c, &t.method)))
+                .collect();
+            undo();
+            out.push((
+                idx,
+                x.target.clone(),
+                Err(format!(
+                    "the test file was rolled back to how it was: the new method_php fails rows {} — fix it and send it again:\n{}",
+                    old_failing.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
+                    lines.join("\n")
+                )),
+            ));
+            continue;
+        }
+        let to_remove: Vec<String> = new_cases
+            .iter()
+            .filter(|c| status(c) != Some(true))
+            .map(|c| c.to_string())
+            .collect();
+        let mut reply = format!(
+            "{}: {} row(s) written{}{}",
+            x.rel,
+            t.rows.len() - to_remove.len(),
+            if x.replace { ", method replaced" } else { "" },
+            x.removed_note
         );
+        for c in &to_remove {
+            reply += &format!("\n- {c} failed and was removed ({})", detail(c, &t.method));
+        }
+        if !to_remove.is_empty()
+            && let Err(e) = testwrite::remove_rows_unlocked(&x.file, &t.method, &to_remove)
+        {
+            undo();
+            out.push((
+                idx,
+                x.target.clone(),
+                Err(format!("the test file was rolled back to how it was: {e}")),
+            ));
+            continue;
+        }
+        let passing_bugs: Vec<&String> = bug_rows.iter().filter(|c| status(c) == Some(true)).collect();
+        if !old_failing.is_empty() {
+            reply += &format!(
+                "\n- rows already in {} that fail now (not removed; fix with replace or remove): {}",
+                t.method,
+                old_failing.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !passing_bugs.is_empty() {
+            reply += &format!(
+                "\n- marked as bugs but passing (not bugs; send them again without bug to move them): {}",
+                passing_bugs.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        if !to_remove.is_empty() {
+            reply += "\nRead the code for each removed case: if the code is wrong, send the row again with bug set; if the test was wrong, fix args_php.";
+        }
+        done_targets.push((x.target.clone(), t.method.clone()));
+        out.push((idx, x.target.clone(), Ok(reply)));
     }
-    if !passing_bugs.is_empty() {
-        out += &format!(
-            "\n- marked as bugs but passing (not bugs; send them again without bug to move them): {}",
-            passing_bugs.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
-        );
+    drop(locks);
+    if !done_targets.is_empty() {
+        let _ = State::update(cfg, |st| {
+            for (target, method) in &done_targets {
+                st.failing.retain(|f| !testwrite::same_method(f, method));
+                st.done(&format!("tests:{target}"));
+            }
+        });
     }
-    if !to_remove.is_empty() {
-        out += "\nRead the code for each removed case: if the code is wrong, send the row again with bug set; if the test was wrong, fix args_php.";
-    }
-    Ok(out)
+    out
 }
 
 fn run_tests(p: &mut Project, filter: Option<&str>) -> Result<String, String> {
@@ -2600,9 +2873,11 @@ fn run_tests(p: &mut Project, filter: Option<&str>) -> Result<String, String> {
             filter_all(&cfg)
         }
     };
+    // empty data providers older versions left would fail every run, filtered or not
+    let repaired = testwrite::repair_empty(&cfg);
     let res = {
-        let _lock = State::test_lock(&cfg)?;
-        testwrite::run(&cfg, &filter)?
+        let (_lock, slot) = State::test_slot(&cfg)?;
+        testwrite::run(&cfg, &filter, slot)?
     };
     let failing: Vec<String> = res
         .failed
@@ -2616,13 +2891,22 @@ fn run_tests(p: &mut Project, filter: Option<&str>) -> Result<String, String> {
         .map(crate::issues::Issue::point)
         .collect();
     Ok(format!(
-        "{} passed, {} failed{}",
+        "{} passed, {} failed{}{}",
         res.passed.len(),
         res.failed.len(),
         if points.is_empty() {
             String::new()
         } else {
             format!("\n- {}", points.join("\n- "))
+        },
+        if repaired.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nrepaired {} doctest method(s) with an empty data provider (left by an older doctest; PHPUnit failed them on every run): {}",
+                repaired.len(),
+                repaired.join(", ")
+            )
         }
     ))
 }
@@ -2679,6 +2963,7 @@ pub fn serve(workers: usize) {
                 if let Some(reply) = server.handle(&msg) {
                     write(&out, reply);
                 }
+                crate::codemap::save_memo();
             }
         }));
     }
@@ -2939,6 +3224,50 @@ mod tests {
     }
 
     #[test]
+    fn write_doc_reads_markdown_from_a_file_and_facts_can_be_brief() {
+        let (d, cfg) = project();
+        let mut s = server();
+        let f = d.path().join("guide.md");
+        std::fs::write(
+            &f,
+            "---\ntitle: New Order\nkind: page\nmodule: orders\nroutes: [shop.orders.create]\n---\nClick **Save**.\n",
+        )
+        .unwrap();
+        let (text, err) = call(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "markdown_file": f}),
+        );
+        assert!(!err, "{text}");
+        assert!(cfg.out.join("guide/en/orders/shop-orders-create.html").is_file());
+        let (full, _) = call(
+            &mut s,
+            "facts",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create"}),
+        );
+        let (brief, err) = call(
+            &mut s,
+            "facts",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create", "brief": true}),
+        );
+        assert!(!err, "{brief}");
+        assert!(
+            full.contains("Click **Save**") && !brief.contains("Click **Save**"),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("characters; read the guide at source_path") && brief.contains("\"labels\""),
+            "{brief}"
+        );
+        let (text, err) = call(
+            &mut s,
+            "write_doc",
+            json!({"project": cfg.root, "item": "guide:en:shop.orders.create"}),
+        );
+        assert!(err && text.contains("markdown_file"), "{text}");
+    }
+
+    #[test]
     fn write_doc_saves_marks_documented_and_builds() {
         let (_d, cfg) = project();
         let mut s = server();
@@ -3055,6 +3384,45 @@ mod tests {
             "{php}"
         );
         assert!(!php.contains("'mine'"), "{php}");
+    }
+
+    #[test]
+    fn write_test_batch_runs_several_targets_once() {
+        let (_d, cfg) = project();
+        // one run's output for both methods; `{slot}` picks the output file of the slot
+        std::fs::write(
+            cfg.backend.join("fake1.txt"),
+            "  ✓ store with data set \"forbidden\"\n  ✓ store again with data set \"state:paid\"\n  ⨯ store again with data set \"state:closed\"\n   FAILED  Tests\\Feature\\Http\\Controllers\\OrderControllerTest > store again with data set \"state:closed\"\n  Expected 422 but received 200.\n\n  Tests: 1 failed, 2 passed\n",
+        )
+        .unwrap();
+        let toml = std::fs::read_to_string(cfg.root.join(".doctest.toml")).unwrap()
+            + "[tests]\nrun = \"cat fake{slot}.txt # {filter}\"\nparallel = 2\n";
+        std::fs::write(cfg.root.join(".doctest.toml"), toml).unwrap();
+        let mut s = server();
+        let args = json!({"project": cfg.root, "tests": [
+            {"target": "POST api/orders/{order}", "method": "test_store", "method_php": "public function test_store(int $s): void {}", "rows": [{"case": "forbidden", "args_php": "403"}]},
+            {"target": "POST api/orders/{order}", "method": "test_store_again", "method_php": "public function test_store_again(int $s): void {}", "rows": [{"case": "state:paid", "args_php": "200"}, {"case": "state:closed", "args_php": "422"}]},
+            {"target": "POST api/orders/{order}", "method": "test_store_x", "rows": [{"case": "guest", "args_php": "401"}]}
+        ]});
+        let (text, err) = call(&mut s, "write_test", args);
+        assert!(!err, "{text}");
+        assert!(text.contains("3 target(s): 2 written, 1 not written"), "{text}");
+        assert!(
+            text.contains("state:closed failed and was removed") && text.contains("Expected 422"),
+            "{text}"
+        );
+        assert!(text.contains("already covered"), "{text}");
+        let php = std::fs::read_to_string(
+            cfg.backend
+                .join("tests/Feature/Http/Controllers/OrderControllerTest.php"),
+        )
+        .unwrap();
+        assert!(
+            php.contains("'forbidden' => [403]") && php.contains("'state:paid' => [200]"),
+            "{php}"
+        );
+        assert!(!php.contains("state:closed"), "{php}");
+        assert!(State::load(&cfg).queue.is_empty());
     }
 
     #[test]

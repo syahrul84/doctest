@@ -6,6 +6,12 @@ Not released yet: being tested on real projects first.
 
 Fixes from the first long run on a real project:
 
+- Speed: codemap's answers are kept between tool calls and between doctest processes while git sees no code change
+  (facts 20 s → under a second, cases 4 s → 0.1 s on a 1,500-page app); each test file's coverage is read once until
+  it changes. write_test takes `tests: [...]`: several targets written and run in ONE test run. `[tests] parallel =
+  N` lets N test runs go at once, each with its own `{slot}` database (doctor warns without `{slot}`). write_doc takes
+  `markdown_file`; facts takes `brief: true`. run_tests repairs empty data providers older versions left. doctest's
+  own unit tests no longer write into ~/.doctest (reports, caches).
 - Tests: each row is judged by its own data set in the run (coloured output is read, a key printed with spaces
   for underscores is still matched); a row that did not run is not kept, and a run where no row ran (an invalid
   data provider, a file that does not parse) rolls the write back; a removed row says why (file:line and

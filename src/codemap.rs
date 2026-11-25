@@ -1,7 +1,7 @@
 //! Code facts from codemap: one `codemap serve` child per app, spoken to over MCP stdio.
 //! Tests use `FixtureCodemap`, which answers from JSON files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -224,6 +224,124 @@ pub struct LiveCodemap {
     backend: PathBuf,
     frontends: BTreeMap<String, PathBuf>,
     servers: BTreeMap<String, Server>,
+    /// Folders whose changes do not change codemap's answers to doctest: its own output and the tests it writes.
+    ignore: Vec<PathBuf>,
+}
+
+/// Answers kept between tool calls (shared by every worker thread) while the code is unchanged:
+/// (backend, app, tool, args) → (code signature, answer).
+static MEMO: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (String, Answer)>>> =
+    std::sync::LazyLock::new(Default::default);
+/// Backend → the code signature and when it was taken (taken again after a few seconds).
+type Sig = (std::time::Instant, Option<String>);
+static SIGS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Sig>>> = std::sync::LazyLock::new(Default::default);
+
+/// Memo entries added since the last save.
+static MEMO_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn memo_file(backend: &str) -> PathBuf {
+    let id = crate::hash::sha256(backend);
+    crate::reports::tool_root()
+        .join("cache")
+        .join(format!("codemap-{}.json", &id[..12]))
+}
+
+/// The answers a previous doctest kept for this backend, when the code still has the same signature.
+fn load_memo(backend: &str, sig: &str) {
+    let Ok(text) = std::fs::read_to_string(memo_file(backend)) else {
+        return;
+    };
+    let Ok(saved) = serde_json::from_str::<Vec<(String, String, Value, Option<String>)>>(&text) else {
+        return;
+    };
+    let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    for (key, s, data, next_cursor) in saved {
+        if s == sig {
+            memo.entry(key).or_insert((
+                s,
+                Answer {
+                    data,
+                    stale: false,
+                    call_id: None,
+                    next_cursor,
+                },
+            ));
+        }
+    }
+}
+
+/// Keeps the answers on disk (per backend), so the next doctest process starts warm. Called after each tool call.
+pub fn save_memo() {
+    if !MEMO_DIRTY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let sigs: HashMap<String, Option<String>> = SIGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, (_, s))| (k.clone(), s.clone()))
+        .collect();
+    let memo = MEMO.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for (backend, sig) in sigs {
+        let Some(sig) = sig else { continue };
+        let prefix = format!("{backend}\u{1}");
+        let rows: Vec<(String, String, Value, Option<String>)> = memo
+            .iter()
+            .filter(|(k, (s, _))| k.starts_with(&prefix) && *s == sig)
+            .map(|(k, (s, a))| (k.clone(), s.clone(), a.data.clone(), a.next_cursor.clone()))
+            .collect();
+        let path = memo_file(&backend);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(t) = serde_json::to_string(&rows) {
+            let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, t).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
+/// What the code of these repos looks like now, cheaply: each one's commit, the files git sees changed or new, and
+/// their sizes and times. None when a folder is not a git repo (then nothing is kept between calls).
+fn code_signature(dirs: &[&PathBuf], ignore: &[PathBuf]) -> Option<String> {
+    let mut parts = Vec::new();
+    for d in dirs {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(d)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let head = git(&["rev-parse", "HEAD"])?;
+        let status = git(&["status", "--porcelain", "--untracked-files=all"])?;
+        parts.push(head);
+        for line in status.lines() {
+            let path = line.get(3..).unwrap_or_default();
+            let path = path.rsplit(" -> ").next().unwrap_or(path).trim_matches('"');
+            if ignore.iter().any(|i| d.join(path).starts_with(i)) {
+                continue;
+            }
+            let meta = std::fs::metadata(d.join(path)).ok();
+            let stamp = meta
+                .map(|m| {
+                    let t = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|t| t.as_nanos())
+                        .unwrap_or(0);
+                    format!("{}:{t}", m.len())
+                })
+                .unwrap_or_else(|| "gone".into());
+            parts.push(format!("{line}|{stamp}"));
+        }
+    }
+    Some(crate::hash::sha256(&parts.join("\n")))
 }
 
 impl LiveCodemap {
@@ -249,7 +367,37 @@ impl LiveCodemap {
                 .map(|f| (Config::repo_name(f), f.clone()))
                 .collect(),
             servers: BTreeMap::new(),
+            ignore: vec![
+                cfg.out.clone(),
+                cfg.backend.join("tests"),
+                cfg.backend.join("storage"),
+                cfg.backend.join(".doctest"),
+            ],
         }
+    }
+
+    /// The current code signature, taken at most every few seconds (one tool call makes many codemap calls).
+    fn signature(&self) -> Option<String> {
+        let id = self.backend.to_string_lossy().into_owned();
+        let mut sigs = SIGS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, sig)) = sigs.get(&id)
+            && at.elapsed() < std::time::Duration::from_secs(3)
+        {
+            return sig.clone();
+        }
+        let first = !sigs.contains_key(&id);
+        let mut dirs: Vec<&PathBuf> = vec![&self.backend];
+        dirs.extend(self.frontends.values());
+        let sig = code_signature(&dirs, &self.ignore);
+        let changed = sigs.get(&id).is_some_and(|(_, old)| *old != sig);
+        sigs.insert(id.clone(), (std::time::Instant::now(), sig.clone()));
+        drop(sigs);
+        if let Some(sg) = &sig
+            && (first || changed)
+        {
+            load_memo(&id, sg);
+        }
+        sig
     }
 
     /// A client for parallel worker `n` (1-based), with its own index copies.
@@ -303,6 +451,19 @@ impl LiveCodemap {
 
 impl CodemapApi for LiveCodemap {
     fn call(&mut self, app: &str, tool: &str, args: Value) -> Result<Answer, String> {
+        // the same question on unchanged code gets the same answer: kept between tool calls
+        let key = format!("{}\u{1}{app}\u{1}{tool}\u{1}{args}", self.backend.display());
+        let sig = if tool == "report_wrong_answer" {
+            None
+        } else {
+            self.signature()
+        };
+        if let Some(sig) = &sig
+            && let Some((s, a)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
+            && s == sig
+        {
+            return Ok(a.clone());
+        }
         let started = std::time::Instant::now();
         let result = self
             .server(app)?
@@ -322,7 +483,18 @@ impl CodemapApi for LiveCodemap {
         if result["isError"].as_bool() == Some(true) {
             return Err(format!("codemap {tool}: {text}"));
         }
-        parse_answer(&text).map_err(|e| format!("codemap {tool}: {e}"))
+        let answer = parse_answer(&text).map_err(|e| format!("codemap {tool}: {e}"))?;
+        if let Some(sig) = sig
+            && !answer.stale
+        {
+            let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+            if memo.len() > 20_000 {
+                memo.clear();
+            }
+            memo.insert(key, (sig, answer.clone()));
+            MEMO_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(answer)
     }
 }
 

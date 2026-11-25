@@ -245,6 +245,16 @@ pub fn run(cfg: Option<&Config>, start: &Path) -> Vec<Check> {
             format!("`{first}` (from [tests] run) is not on PATH"),
         )
     });
+    if cfg.tests.parallel > 1 && !cfg.tests.run.contains("{slot}") {
+        out.push(check(
+            "tests",
+            Status::Warn,
+            format!(
+                "[tests] parallel = {} but the run line has no {{slot}}: parallel runs would share one test database; add e.g. `-e DB_DATABASE=app_test_{{slot}}` and create app_test_1..{}",
+                cfg.tests.parallel, cfg.tests.parallel
+            ),
+        ));
+    }
     out.push(match crate::state::State::load_strict(cfg) {
         Ok(_) => check(
             "state",

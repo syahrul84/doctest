@@ -42,6 +42,28 @@ pub struct State {
 pub struct FileLock(PathBuf);
 
 impl FileLock {
+    /// The lock if nobody holds it (or its holder is gone), without waiting.
+    pub fn try_acquire(path: PathBuf, stale_secs: u64) -> Result<Option<FileLock>, String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(_) => Ok(Some(FileLock(path))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let old = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > stale_secs);
+                if old {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Ok(None)
+            }
+            Err(e) => Err(format!("cannot lock {}: {e}", path.display())),
+        }
+    }
+
     pub fn acquire(path: PathBuf) -> Result<FileLock, String> {
         FileLock::acquire_with(path, 120)
     }
@@ -281,8 +303,25 @@ impl State {
     }
 
     /// Test runs one at a time per project (they share a test database).
-    pub fn test_lock(cfg: &Config) -> Result<FileLock, String> {
-        FileLock::acquire_with(cfg.out.join(".doctest/tests.lock"), 3600)
+    /// A test runner slot: with `[tests] parallel = N`, up to N runs at once (each with its own `{slot}` database);
+    /// otherwise one at a time. Waits for a free slot.
+    pub fn test_slot(cfg: &Config) -> Result<(FileLock, usize), String> {
+        let n = cfg.tests.parallel.max(1);
+        if n == 1 {
+            return Ok((FileLock::acquire_with(cfg.out.join(".doctest/tests.lock"), 3600)?, 1));
+        }
+        let started = std::time::Instant::now();
+        loop {
+            for slot in 1..=n {
+                if let Some(l) = FileLock::try_acquire(cfg.out.join(format!(".doctest/tests-{slot}.lock")), 3600)? {
+                    return Ok((l, slot));
+                }
+            }
+            if started.elapsed().as_secs() > 3600 {
+                return Err("waited an hour for a free test slot; remove document/.doctest/tests-*.lock if no doctest is running".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     pub fn save(&self, cfg: &Config) -> Result<(), String> {

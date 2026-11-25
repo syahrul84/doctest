@@ -96,8 +96,8 @@ pub fn run(
     if !r.tests_run.is_empty() {
         progress.step(0, 1, &format!("running {} affected test file(s)", r.tests_run.len()));
         let res = {
-            let _lock = State::test_lock(cfg)?;
-            crate::testwrite::run_files(cfg, &r.tests_run)?
+            let (_lock, slot) = State::test_slot(cfg)?;
+            crate::testwrite::run_files(cfg, &r.tests_run, slot)?
         };
         r.test_output = crate::testwrite::tail(&res.output, 80);
         r.errors.extend(failing_tests(&res));

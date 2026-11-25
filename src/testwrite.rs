@@ -500,6 +500,59 @@ fn settle_method(mut text: String, m: &str) -> String {
     tidy.replace(&text, format!("{START}\n$1")).into_owned()
 }
 
+/// Doctest methods left by older versions with an empty main data provider (PHPUnit reports an empty data set as
+/// an error on every run, filtered or not): made helpers of their bug test, or removed when they have no rows at
+/// all. Returns `file: method` of each one repaired.
+pub fn repair_empty(cfg: &Config) -> Vec<String> {
+    static CASES_FN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"function\s+cases_(\w+)\s*\(").unwrap());
+    let mut files = Vec::new();
+    find_php(&cfg.backend.join("tests"), &mut files);
+    let mut out = Vec::new();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let (Some(s), Some(e)) = (text.find(START), text.find(END)) else {
+            continue;
+        };
+        let methods: Vec<String> = CASES_FN.captures_iter(&text[s..e]).map(|c| c[1].to_string()).collect();
+        let empty: Vec<&String> = methods
+            .iter()
+            .filter(|m| {
+                provider_rows(&text, &format!("cases_{m}")).is_empty()
+                    && text.contains(&format!("public function {m}("))
+            })
+            .collect();
+        if empty.is_empty() {
+            continue;
+        }
+        let Ok(_lock) = file_lock(&f) else { continue };
+        let Ok(mut now) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for m in &empty {
+            now = settle_method(now, m);
+        }
+        if write_atomic(&f, &now).is_ok() {
+            let rel = f.strip_prefix(&cfg.backend).unwrap_or(&f).display().to_string();
+            out.extend(empty.iter().map(|m| format!("{rel}: {m}")));
+        }
+    }
+    out
+}
+
+fn find_php(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            find_php(&p, out);
+        } else if p.extension().is_some_and(|x| x == "php") {
+            out.push(p);
+        }
+    }
+}
+
 /// Row keys of provider `name` in `text`, with the bug note of each row.
 pub fn provider_rows(text: &str, name: &str) -> Vec<(String, Option<String>)> {
     let Some((s, e)) = function_span(text, name) else {
@@ -1019,6 +1072,18 @@ pub fn filter_for(class: &str, methods: &[String]) -> String {
     format!("/{class}::(?:{})\\b/", methods.join("|"))
 }
 
+/// One --filter for methods of several classes.
+pub fn filter_for_many(by_class: &[(String, Vec<String>)]) -> String {
+    if by_class.len() == 1 {
+        return filter_for(&by_class[0].0, &by_class[0].1);
+    }
+    let parts: Vec<String> = by_class
+        .iter()
+        .map(|(c, ms)| format!("{c}::(?:{})", ms.join("|")))
+        .collect();
+    format!("/(?:{})\\b/", parts.join("|"))
+}
+
 /// `value` quoted for where `{filter}` stands in the run line: inside a single-quoted `sh -c '…'` it is double
 /// quoted for the inner shell, elsewhere single quoted.
 pub fn quote_for(template: &str, value: &str) -> String {
@@ -1053,18 +1118,24 @@ pub fn quote_for(template: &str, value: &str) -> String {
 
 /// Runs `[tests] run` with `--filter <filter>` in the backend repo; with `file`, only that test file is loaded
 /// (another worker's file being written cannot break the run).
-pub fn run(cfg: &Config, filter: &str) -> Result<RunResult, String> {
-    run_in(cfg, None, filter)
+pub fn run(cfg: &Config, filter: &str, slot: usize) -> Result<RunResult, String> {
+    run_in(cfg, &[], filter, slot)
 }
 
-pub fn run_in(cfg: &Config, file: Option<&str>, filter: &str) -> Result<RunResult, String> {
-    let t = &cfg.tests.run;
+/// The run line for a slot: `{slot}` is the slot number (1..N), for a database per parallel run.
+fn run_line(cfg: &Config, slot: usize) -> String {
+    cfg.tests.run.replace("{slot}", &slot.to_string())
+}
+
+/// Runs only these test files (none: all) with `--filter`.
+pub fn run_in(cfg: &Config, files: &[String], filter: &str, slot: usize) -> Result<RunResult, String> {
+    let t = run_line(cfg, slot);
     let mut arg = String::new();
-    if let Some(f) = file {
-        arg += &quote_for(t, f);
+    for f in files {
+        arg += &quote_for(&t, f);
         arg.push(' ');
     }
-    arg += &format!("--filter {}", quote_for(t, filter));
+    arg += &format!("--filter {}", quote_for(&t, filter));
     let cmd = t.replace("{filter}", &arg);
     let out = Command::new("sh")
         .arg("-c")
@@ -1089,9 +1160,10 @@ pub fn run_in(cfg: &Config, file: Option<&str>, filter: &str) -> Result<RunResul
 }
 
 /// Runs `[tests] run` on these test files (paths relative to the backend).
-pub fn run_files(cfg: &Config, files: &[String]) -> Result<RunResult, String> {
-    let args: Vec<String> = files.iter().map(|f| quote_for(&cfg.tests.run, f)).collect();
-    let cmd = cfg.tests.run.replace("{filter}", &args.join(" "));
+pub fn run_files(cfg: &Config, files: &[String], slot: usize) -> Result<RunResult, String> {
+    let t = run_line(cfg, slot);
+    let args: Vec<String> = files.iter().map(|f| quote_for(&t, f)).collect();
+    let cmd = t.replace("{filter}", &args.join(" "));
     let out = Command::new("sh")
         .arg("-c")
         .arg(&cmd)
@@ -1633,5 +1705,33 @@ mod tests {
         assert_eq!(ns, "Tests\\Feature\\Http\\Controllers\\Ar\\Collection");
         let (f, _, _) = target_file(&cfg, "", "App\\Http\\Controllers\\Ap\\CreditNoteController@store");
         assert_eq!(f, ap);
+    }
+
+    #[test]
+    fn empty_providers_left_by_older_versions_are_repaired() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = shop_config(d.path());
+        cfg.backend = d.path().to_path_buf();
+        let f = d.path().join("tests/Feature/AuditTrailCopyTest.php");
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        // what an older doctest left: rows all gone from a method whose bug rows remain, and one with nothing at all
+        let old = format!(
+            "<?php\nclass AuditTrailCopyTest\n{{\n    {START}\n\n    /**\n     * @doctest POST api/a\n     * @dataProvider cases_test_save\n     */\n    #[{DP}('cases_test_save')]\n    public function test_save(int $s): void\n    {{\n    }}\n\n    public static function cases_test_save(): array\n    {{\n        return [\n        ];\n    }}\n\n    /**\n     * @doctest POST api/b\n     * @dataProvider cases_test_amend\n     */\n    #[{DP}('cases_test_amend')]\n    public function test_amend(int $s): void\n    {{\n    }}\n\n    public static function cases_test_amend(): array\n    {{\n        return [\n        ];\n    }}\n{}    {END}\n}}\n",
+            bug_section(
+                "POST api/a",
+                "test_save",
+                "            // @doctest-bug x\n            'ok' => [200],\n"
+            )
+        );
+        fs::write(&f, old).unwrap();
+        let fixed = repair_empty(&cfg);
+        assert_eq!(fixed.len(), 2, "{fixed:?}");
+        let php = fs::read_to_string(&f).unwrap();
+        assert!(
+            php.contains("protected function test_save(") && php.contains("test_save_known_bugs"),
+            "{php}"
+        );
+        assert!(!php.contains("test_amend"), "{php}");
+        assert!(repair_empty(&cfg).is_empty());
     }
 }

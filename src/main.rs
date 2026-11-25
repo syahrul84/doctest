@@ -518,6 +518,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+    codemap::save_memo();
     match result {
         Ok((text, ok)) => {
             println!("{text}");

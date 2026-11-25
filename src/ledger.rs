@@ -11,17 +11,44 @@ use crate::pages::Endpoint;
 use crate::state::{CoverSource, Covered};
 use crate::testwrite::provider_rows;
 
+/// Each test file's coverage, kept between calls while the file (size, time) and the endpoints asked about are the
+/// same: a big app has thousands of test files, and cases / write_test ask on every call.
+type Scanned = (u64, std::time::SystemTime, Vec<Covered>);
+static SCANNED: LazyLock<std::sync::Mutex<std::collections::HashMap<(PathBuf, String), Scanned>>> =
+    LazyLock::new(Default::default);
+
 pub fn scan(cfg: &Config, endpoints: &[Endpoint]) -> Vec<Covered> {
     let mut files = Vec::new();
     collect(&cfg.backend.join("tests"), &mut files);
     files.sort();
+    let ep_key = crate::hash::sha256(
+        &endpoints
+            .iter()
+            .map(|e| format!("{} {} {}", e.method, e.uri, e.route_name.as_deref().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     let mut out = Vec::new();
     for f in files {
+        let Ok(meta) = std::fs::metadata(&f) else { continue };
+        let stamp = (meta.len(), meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+        let k = (f.clone(), ep_key.clone());
+        if let Some((len, time, covered)) = SCANNED.lock().unwrap_or_else(|e| e.into_inner()).get(&k)
+            && (*len, *time) == stamp
+        {
+            out.extend(covered.iter().cloned());
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
         let rel = f.strip_prefix(&cfg.backend).unwrap_or(&f).to_path_buf();
-        out.extend(scan_text(cfg, &rel, &text, endpoints));
+        let covered = scan_text(cfg, &rel, &text, endpoints);
+        out.extend(covered.iter().cloned());
+        SCANNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(k, (stamp.0, stamp.1, covered));
     }
     out
 }

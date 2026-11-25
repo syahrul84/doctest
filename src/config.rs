@@ -130,6 +130,9 @@ pub struct TestConfig {
     /// Test targets never handed out (`GET oauth/*`, `App\\Console\\Commands\\Sync::*`): code that cannot run
     /// under PHPUnit (exit(), dd(), real network) or routes of a package.
     pub exclude: Vec<String>,
+    /// Test runs at the same time (default 1). Above 1 the run line needs `{slot}` (1..N) to give each run its own
+    /// database, e.g. `-e DB_DATABASE=app_test_{slot}`.
+    pub parallel: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +225,7 @@ struct RawTests {
     feature_dir: Option<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    parallel: Option<usize>,
 }
 
 #[derive(Deserialize, Default)]
@@ -341,6 +345,7 @@ impl Config {
                 unit_dir: PathBuf::from(raw.tests.unit_dir.unwrap_or_else(|| "tests/Unit".into())),
                 feature_dir: PathBuf::from(raw.tests.feature_dir.unwrap_or_else(|| "tests/Feature".into())),
                 exclude: raw.tests.exclude,
+                parallel: raw.tests.parallel.unwrap_or(1).max(1),
             },
             guide: GuideConfig {
                 modules_from: raw.guide.modules_from.map(|m| root.join(m)),

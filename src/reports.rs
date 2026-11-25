@@ -52,6 +52,10 @@ pub fn tool_root() -> PathBuf {
     if let Ok(h) = std::env::var("DOCTEST_HOME") {
         return PathBuf::from(h);
     }
+    // doctest's own tests never write into the user's reports, caches or Chrome profile
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("doctest-unit-tests-{}", std::process::id()));
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".doctest")
 }
 
