@@ -1,0 +1,10 @@
+<!doctype html><html><body>
+<form id="f"><input name="username"><input name="password" type="password"><button type="submit">Sign in</button></form>
+<script>
+document.getElementById('f').addEventListener('submit', function (e) {
+  e.preventDefault();
+  localStorage.setItem('user', document.querySelector('[name=username]').value);
+  location.href = '/orders.html';
+});
+</script>
+</body></html>

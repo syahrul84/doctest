@@ -1,0 +1,1 @@
+{"data":{"found":true,"table":"orders","columns":[{"name":"id","type":"bigint","keys":["primary"]},{"name":"status","type":"varchar(20)","keys":["index"]},{"name":"placed_at","type":"datetime"},{"name":"customer_id","type":"bigint"}],"created_in":"database/migrations/2026_01_01_000000_create_orders_table.php:10"},"meta":{}}

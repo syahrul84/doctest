@@ -1,0 +1,9 @@
+<!doctype html><html><body>
+<div class="admin-layout"><h1>Denied</h1></div>
+<script>
+// like an app whose HTTP client drops the sign-in on any 401
+fetch('/api/denied').then(function (r) {
+  if (r.status === 401) { localStorage.clear(); location.href = '/login.html'; }
+});
+</script>
+</body></html>

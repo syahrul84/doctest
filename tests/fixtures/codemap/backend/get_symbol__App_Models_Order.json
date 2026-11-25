@@ -1,0 +1,1 @@
+{"data":{"found":true,"fqn":"App\\Models\\Order","kind":"class","file":"app/Models/Order.php","line":7,"model":{"table":"orders","relations":["customer: belongsTo Customer (customer_id) :9"]}},"meta":{}}

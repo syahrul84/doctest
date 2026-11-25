@@ -1,0 +1,4 @@
+{"data":{"found":true,"pages":[
+ {"path":"/shop/orders/create","name":"shop.orders.create","file":"src/pages/ShopOrderForm.vue","source":"router","defined_in":"src/router.ts:5"},
+ {"path":"/shop/orders/create","name":"shop.orders.create","file":null,"source":"router","defined_in":"tests/x.spec.ts:1","note":"component `Page` is not an import"}
+]},"meta":{"project":"web"}}

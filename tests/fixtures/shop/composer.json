@@ -1,0 +1,1 @@
+{"name": "acme/shop", "require": {"php": "^8.5", "laravel/framework": "^13.0", "ext-gd": "*", "ext-intl": "*"}}
